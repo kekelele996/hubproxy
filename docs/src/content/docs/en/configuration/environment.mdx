@@ -1,4 +1,4 @@
-﻿---
+---
 title: Environment Variables
 description: Environment variables supported by HubProxy.
 ---
@@ -21,6 +21,11 @@ Environment variables override config after `config.toml` is loaded. Sections no
 | `IP_BLACKLIST` | `[security].blackList` | Append blocked IPs, comma-separated |
 | `ACCESS_PROXY` | `[access].proxy` | Upstream SOCKS5 proxy URL |
 | `MAX_IMAGES` | `[download].maxImages` | Max images per batch offline download |
+| `DOCKER_HUB_UPSTREAMS` | `[upstream].dockerHubUpstreams` | Docker Hub upstreams, comma-separated, in priority order |
+| `UPSTREAM_FAILURE_THRESHOLD` | `[upstream].failureThreshold` | Consecutive failures before removing an upstream |
+| `UPSTREAM_HEALTH_CHECK_ENABLED` | `[upstream].healthCheckEnabled` | Actively probe removed upstreams (`true`/`false`) |
+
+Other failover keys (`cooldown`, `healthCheckInterval`, `probeTimeout`) and per-registry `upstreams` lists are config-file only — see the [config.toml reference](/configuration/reference/#upstream).
 
 ## Examples
 

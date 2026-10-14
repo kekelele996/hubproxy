@@ -1,9 +1,45 @@
-﻿---
+---
 title: Registry Sources
 description: Configure upstream registry mappings in HubProxy.
 ---
 
-HubProxy uses the `[registries]` section for third-party registry upstreams and auth endpoints. Docker Hub always proxies to `registry-1.docker.io` and is not configured here.
+HubProxy uses the `[registries]` section for third-party registry upstreams and auth endpoints. Docker Hub defaults to `registry-1.docker.io` and accepts multiple mirrors via the `[upstream]` section.
+
+## Upstream Failover
+
+When an upstream occasionally goes down, HubProxy automatically tries the next one in priority order instead of failing the request, and switches back after it recovers. Switching never interrupts in-flight downloads.
+
+```toml
+[upstream]
+# Prefer the mirror, fall back to direct access to the official registry
+dockerHubUpstreams = ["docker.m.example.com", "registry-1.docker.io"]
+failureThreshold = 3      # remove after 3 consecutive failures
+cooldown = "30s"          # half-open probe after a 30s cooldown
+healthCheckEnabled = true # actively probe removed upstreams for recovery
+```
+
+Environment variable shortcut (handy for Docker deployments):
+
+```bash
+DOCKER_HUB_UPSTREAMS=docker.m.example.com,registry-1.docker.io
+```
+
+Switching rules:
+
+- Connection errors, timeouts, 429/5xx trigger a switch; 404 from one mirror is retried on the next (a pull-through cache may not have synced yet), and 404 is returned only when every mirror misses. 401/403 are returned directly.
+- Each request captures an upstream candidate snapshot when it starts; removing or recovering an upstream never affects that request.
+- Layer/blob streams switch transparently until the first byte flows, then pin the current upstream to keep the payload intact.
+- Individual third-party registries accept multiple upstreams too:
+
+```toml
+[registries."ghcr.io"]
+upstreams = ["ghcr-mirror.example.com", "ghcr.io"]
+authHost = "ghcr.io/token"
+authType = "github"
+enabled = true
+```
+
+The `upstreams` field of `GET /ready` shows the current health of every upstream pool.
 
 ## Default Mappings
 

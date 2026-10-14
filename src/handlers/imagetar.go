@@ -20,10 +20,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1"
-	"github.com/google/go-containerregistry/pkg/v1/partial"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"hubproxy/config"
@@ -256,15 +254,50 @@ func NewImageStreamer(cfg *ImageStreamerConfig) *ImageStreamer {
 		}
 	}
 
-	remoteOptions := []remote.Option{
-		remote.WithAuth(authn.Anonymous),
-		remote.WithTransport(utils.GetGlobalHTTPClient().Transport),
-	}
-
 	return &ImageStreamer{
 		concurrency:   concurrency,
-		remoteOptions: remoteOptions,
+		remoteOptions: baseRemoteOptions(),
 	}
+}
+
+// parseImageRefWithLocator 解析镜像引用并推断故障切换池；
+// 未配置的第三方 Registry 退化为仅直连其自身主机。
+func parseImageRefWithLocator(imageRef string) (name.Reference, refLocator, error) {
+	ref, err := name.ParseReference(imageRef)
+	if err != nil {
+		return nil, refLocator{}, err
+	}
+
+	loc, ok := locatorForRef(ref)
+	if !ok {
+		registry := ref.Context().RegistryStr()
+		loc = refLocator{
+			pool:  "direct:" + registry,
+			hosts: []string{registry},
+			repo:  ref.Context().RepositoryStr(),
+		}
+	}
+	return ref, loc, nil
+}
+
+// fetchImageConfig 通过故障切换池拉取镜像 config blob，并校验其 JSON 格式。
+func fetchImageConfig(loc refLocator, digest string, options []remote.Option) ([]byte, error) {
+	reader, err := openBlobWithFailover(loc, digest, true, options)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	var configFile v1.ConfigFile
+	if err := json.Unmarshal(data, &configFile); err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
 // StreamOptions 下载选项
@@ -280,7 +313,7 @@ func (is *ImageStreamer) StreamImageToWriter(ctx context.Context, imageRef strin
 		options = &StreamOptions{UseCompressedLayers: true}
 	}
 
-	ref, err := name.ParseReference(imageRef)
+	ref, loc, err := parseImageRefWithLocator(imageRef)
 	if err != nil {
 		return fmt.Errorf("解析镜像引用失败: %w", err)
 	}
@@ -289,23 +322,23 @@ func (is *ImageStreamer) StreamImageToWriter(ctx context.Context, imageRef strin
 
 	contextOptions := append(is.remoteOptions, remote.WithContext(ctx))
 
-	desc, err := is.getImageDescriptor(ref, contextOptions)
+	desc, err := is.getImageDescriptorWithFailover(loc, ref.Identifier(), contextOptions)
 	if err != nil {
 		return fmt.Errorf("获取镜像描述失败: %w", err)
 	}
 	switch desc.MediaType {
 	case types.OCIImageIndex, types.DockerManifestList:
-		return is.streamMultiArchImage(ctx, desc, writer, options, imageRef)
+		return is.streamMultiArchImage(ctx, loc, desc, writer, options, imageRef)
 	case types.OCIManifestSchema1, types.DockerManifestSchema2:
-		return is.streamSingleImage(ctx, desc, writer, options, imageRef)
+		return is.streamSingleImage(ctx, loc, desc, writer, options, imageRef)
 	default:
-		return is.streamSingleImage(ctx, desc, writer, options, imageRef)
+		return is.streamSingleImage(ctx, loc, desc, writer, options, imageRef)
 	}
 }
 
-// getImageDescriptor 获取镜像描述符
-func (is *ImageStreamer) getImageDescriptor(ref name.Reference, options []remote.Option) (*remote.Descriptor, error) {
-	return remote.Get(ref, options...)
+// getImageDescriptorWithFailover 获取镜像描述符（自动故障切换）
+func (is *ImageStreamer) getImageDescriptorWithFailover(loc refLocator, identifier string, options []remote.Option) (*remote.Descriptor, error) {
+	return remoteGetWithFailover(loc, identifier, options)
 }
 
 func setDownloadHeaders(c *gin.Context, filename string, compressed bool) {
@@ -334,13 +367,13 @@ func (is *ImageStreamer) StreamImageToGin(ctx context.Context, imageRef string, 
 		options = &StreamOptions{UseCompressedLayers: true}
 	}
 
-	ref, err := name.ParseReference(imageRef)
+	ref, loc, err := parseImageRefWithLocator(imageRef)
 	if err != nil {
 		return fmt.Errorf("解析镜像引用失败: %w", err)
 	}
 
 	contextOptions := append(is.remoteOptions, remote.WithContext(ctx))
-	desc, err := is.getImageDescriptor(ref, contextOptions)
+	desc, err := is.getImageDescriptorWithFailover(loc, ref.Identifier(), contextOptions)
 	if err != nil {
 		return fmt.Errorf("获取镜像描述失败: %w", err)
 	}
@@ -350,36 +383,36 @@ func (is *ImageStreamer) StreamImageToGin(ctx context.Context, imageRef string, 
 
 	switch desc.MediaType {
 	case types.OCIImageIndex, types.DockerManifestList:
-		return is.streamMultiArchImage(ctx, desc, c.Writer, options, imageRef)
+		return is.streamMultiArchImage(ctx, loc, desc, c.Writer, options, imageRef)
 	case types.OCIManifestSchema1, types.DockerManifestSchema2:
-		return is.streamSingleImage(ctx, desc, c.Writer, options, imageRef)
+		return is.streamSingleImage(ctx, loc, desc, c.Writer, options, imageRef)
 	default:
-		return is.streamSingleImage(ctx, desc, c.Writer, options, imageRef)
+		return is.streamSingleImage(ctx, loc, desc, c.Writer, options, imageRef)
 	}
 }
 
 // streamMultiArchImage 处理多架构镜像
-func (is *ImageStreamer) streamMultiArchImage(ctx context.Context, desc *remote.Descriptor, writer io.Writer, options *StreamOptions, imageRef string) error {
-	img, err := is.selectPlatformImage(desc, options)
+func (is *ImageStreamer) streamMultiArchImage(ctx context.Context, loc refLocator, desc *remote.Descriptor, writer io.Writer, options *StreamOptions, imageRef string) error {
+	img, err := is.selectPlatformImage(ctx, loc, desc, options)
 	if err != nil {
 		return err
 	}
 
-	return is.streamImageLayers(ctx, img, writer, options, imageRef)
+	return is.streamImageLayers(ctx, loc, img, writer, options, imageRef)
 }
 
 // streamSingleImage 处理单架构镜像
-func (is *ImageStreamer) streamSingleImage(ctx context.Context, desc *remote.Descriptor, writer io.Writer, options *StreamOptions, imageRef string) error {
+func (is *ImageStreamer) streamSingleImage(ctx context.Context, loc refLocator, desc *remote.Descriptor, writer io.Writer, options *StreamOptions, imageRef string) error {
 	img, err := desc.Image()
 	if err != nil {
 		return fmt.Errorf("获取镜像失败: %w", err)
 	}
 
-	return is.streamImageLayers(ctx, img, writer, options, imageRef)
+	return is.streamImageLayers(ctx, loc, img, writer, options, imageRef)
 }
 
 // streamImageLayers 处理镜像层
-func (is *ImageStreamer) streamImageLayers(ctx context.Context, img v1.Image, writer io.Writer, options *StreamOptions, imageRef string) error {
+func (is *ImageStreamer) streamImageLayers(ctx context.Context, loc refLocator, img v1.Image, writer io.Writer, options *StreamOptions, imageRef string) error {
 	var finalWriter io.Writer = writer
 
 	if options.Compression {
@@ -391,11 +424,6 @@ func (is *ImageStreamer) streamImageLayers(ctx context.Context, img v1.Image, wr
 	tarWriter := tar.NewWriter(finalWriter)
 	defer tarWriter.Close()
 
-	configFile, err := img.ConfigFile()
-	if err != nil {
-		return fmt.Errorf("获取镜像配置失败: %w", err)
-	}
-
 	layers, err := img.Layers()
 	if err != nil {
 		return fmt.Errorf("获取镜像层失败: %w", err)
@@ -403,24 +431,25 @@ func (is *ImageStreamer) streamImageLayers(ctx context.Context, img v1.Image, wr
 
 	log.Printf("镜像包含 %d 层", len(layers))
 
-	return is.streamDockerFormat(ctx, tarWriter, img, layers, configFile, imageRef, options)
+	return is.streamDockerFormat(ctx, loc, tarWriter, img, layers, imageRef, nil, nil, options)
 }
 
 // streamDockerFormat 生成Docker格式
-func (is *ImageStreamer) streamDockerFormat(ctx context.Context, tarWriter *tar.Writer, img v1.Image, layers []v1.Layer, configFile *v1.ConfigFile, imageRef string, options *StreamOptions) error {
-	return is.streamDockerFormatWithReturn(ctx, tarWriter, img, layers, configFile, imageRef, nil, nil, options)
+func (is *ImageStreamer) streamDockerFormat(ctx context.Context, loc refLocator, tarWriter *tar.Writer, img v1.Image, layers []v1.Layer, imageRef string, manifestOut *map[string]interface{}, repositoriesOut *map[string]map[string]string, options *StreamOptions) error {
+	return is.streamDockerFormatWithReturn(ctx, loc, tarWriter, img, layers, imageRef, manifestOut, repositoriesOut, options)
 }
 
 // streamDockerFormatWithReturn 生成Docker格式并返回manifest和repositories信息
-func (is *ImageStreamer) streamDockerFormatWithReturn(ctx context.Context, tarWriter *tar.Writer, img v1.Image, layers []v1.Layer, configFile *v1.ConfigFile, imageRef string, manifestOut *map[string]interface{}, repositoriesOut *map[string]map[string]string, options *StreamOptions) error {
+func (is *ImageStreamer) streamDockerFormatWithReturn(ctx context.Context, loc refLocator, tarWriter *tar.Writer, img v1.Image, layers []v1.Layer, imageRef string, manifestOut *map[string]interface{}, repositoriesOut *map[string]map[string]string, options *StreamOptions) error {
 	configDigest, err := img.ConfigName()
 	if err != nil {
 		return err
 	}
 
-	configData, err := json.Marshal(configFile)
+	remoteOptions := append(is.remoteOptions, remote.WithContext(ctx))
+	configData, err := fetchImageConfig(loc, configDigest.String(), remoteOptions)
 	if err != nil {
-		return err
+		return fmt.Errorf("获取镜像配置失败: %w", err)
 	}
 
 	configHeader := &tar.Header{
@@ -462,41 +491,30 @@ func (is *ImageStreamer) streamDockerFormatWithReturn(ctx context.Context, tarWr
 				return err
 			}
 
-			var layerSize int64
-			var layerReader io.ReadCloser
-
-			if options != nil && options.UseCompressedLayers {
-				layerSize, err = layer.Size()
-				if err != nil {
-					return err
-				}
-				layerReader, err = layer.Compressed()
-			} else {
-				layerSize, err = partial.UncompressedSize(layer)
-				if err != nil {
-					return err
-				}
-				layerReader, err = layer.Uncompressed()
-			}
-
+			// 每个 layer 独立故障切换：tar 头写出前若上游失败可透明切换，
+			// 首字节写出后锁定当前上游，保证 tar 流不被破坏。
+			compressed := options == nil || options.UseCompressedLayers
+			layerReader, err := openBlobWithFailover(loc, digest.String(), compressed, remoteOptions)
 			if err != nil {
 				return err
 			}
-			defer layerReader.Close()
 
 			layerTarHeader := &tar.Header{
 				Name: layerDir + "/layer.tar",
-				Size: layerSize,
+				Size: layerReader.Size(),
 				Mode: 0644,
 			}
 
 			if err := tarWriter.WriteHeader(layerTarHeader); err != nil {
+				_ = layerReader.Close()
 				return err
 			}
 
 			if _, err := io.Copy(tarWriter, layerReader); err != nil {
+				_ = layerReader.Close()
 				return err
 			}
+			_ = layerReader.Close()
 
 			return nil
 		}(); err != nil {
@@ -573,15 +591,10 @@ func (is *ImageStreamer) streamDockerFormatWithReturn(ctx context.Context, tarWr
 }
 
 // processImageForBatch 处理镜像的公共逻辑
-func (is *ImageStreamer) processImageForBatch(ctx context.Context, img v1.Image, tarWriter *tar.Writer, imageRef string, options *StreamOptions) (map[string]interface{}, map[string]map[string]string, error) {
+func (is *ImageStreamer) processImageForBatch(ctx context.Context, loc refLocator, img v1.Image, tarWriter *tar.Writer, imageRef string, options *StreamOptions) (map[string]interface{}, map[string]map[string]string, error) {
 	layers, err := img.Layers()
 	if err != nil {
 		return nil, nil, fmt.Errorf("获取镜像层失败: %w", err)
-	}
-
-	configFile, err := img.ConfigFile()
-	if err != nil {
-		return nil, nil, fmt.Errorf("获取镜像配置失败: %w", err)
 	}
 
 	log.Printf("镜像包含 %d 层", len(layers))
@@ -589,7 +602,7 @@ func (is *ImageStreamer) processImageForBatch(ctx context.Context, img v1.Image,
 	var manifest map[string]interface{}
 	var repositories map[string]map[string]string
 
-	err = is.streamDockerFormatWithReturn(ctx, tarWriter, img, layers, configFile, imageRef, &manifest, &repositories, options)
+	err = is.streamDockerFormatWithReturn(ctx, loc, tarWriter, img, layers, imageRef, &manifest, &repositories, options)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -598,14 +611,14 @@ func (is *ImageStreamer) processImageForBatch(ctx context.Context, img v1.Image,
 }
 
 func (is *ImageStreamer) streamSingleImageForBatch(ctx context.Context, tarWriter *tar.Writer, imageRef string, options *StreamOptions) (map[string]interface{}, map[string]map[string]string, error) {
-	ref, err := name.ParseReference(imageRef)
+	ref, loc, err := parseImageRefWithLocator(imageRef)
 	if err != nil {
 		return nil, nil, fmt.Errorf("解析镜像引用失败: %w", err)
 	}
 
 	contextOptions := append(is.remoteOptions, remote.WithContext(ctx))
 
-	desc, err := is.getImageDescriptor(ref, contextOptions)
+	desc, err := is.getImageDescriptorWithFailover(loc, ref.Identifier(), contextOptions)
 	if err != nil {
 		return nil, nil, fmt.Errorf("获取镜像描述失败: %w", err)
 	}
@@ -614,7 +627,7 @@ func (is *ImageStreamer) streamSingleImageForBatch(ctx context.Context, tarWrite
 
 	switch desc.MediaType {
 	case types.OCIImageIndex, types.DockerManifestList:
-		img, err = is.selectPlatformImage(desc, options)
+		img, err = is.selectPlatformImage(ctx, loc, desc, options)
 		if err != nil {
 			return nil, nil, fmt.Errorf("选择平台镜像失败: %w", err)
 		}
@@ -630,11 +643,11 @@ func (is *ImageStreamer) streamSingleImageForBatch(ctx context.Context, tarWrite
 		}
 	}
 
-	return is.processImageForBatch(ctx, img, tarWriter, imageRef, options)
+	return is.processImageForBatch(ctx, loc, img, tarWriter, imageRef, options)
 }
 
-// selectPlatformImage 从多架构镜像中选择合适的平台镜像
-func (is *ImageStreamer) selectPlatformImage(desc *remote.Descriptor, options *StreamOptions) (v1.Image, error) {
+// selectPlatformImage 从多架构镜像中选择合适的平台镜像，子 manifest 拉取支持故障切换
+func (is *ImageStreamer) selectPlatformImage(ctx context.Context, loc refLocator, desc *remote.Descriptor, options *StreamOptions) (v1.Image, error) {
 	index, err := desc.ImageIndex()
 	if err != nil {
 		return nil, fmt.Errorf("获取镜像索引失败: %w", err)
@@ -682,7 +695,14 @@ func (is *ImageStreamer) selectPlatformImage(desc *remote.Descriptor, options *S
 		return nil, fmt.Errorf("未找到合适的平台镜像")
 	}
 
-	img, err := index.Image(selectedDesc.Digest)
+	// 子 manifest 按 digest 在各上游间故障切换拉取
+	remoteOptions := append(is.remoteOptions, remote.WithContext(ctx))
+	childDesc, err := remoteGetWithFailover(loc, selectedDesc.Digest.String(), remoteOptions)
+	if err != nil {
+		return nil, fmt.Errorf("获取选中镜像失败: %w", err)
+	}
+
+	img, err := childDesc.Image()
 	if err != nil {
 		return nil, fmt.Errorf("获取选中镜像失败: %w", err)
 	}
@@ -946,7 +966,7 @@ func handleImageInfo(c *gin.Context) {
 		imageRef = imageRef + ":" + tag
 	}
 
-	ref, err := name.ParseReference(imageRef)
+	ref, loc, err := parseImageRefWithLocator(imageRef)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "镜像引用格式错误: " + err.Error()})
 		return
@@ -959,7 +979,7 @@ func handleImageInfo(c *gin.Context) {
 	ctx := c.Request.Context()
 	contextOptions := append(globalImageStreamer.remoteOptions, remote.WithContext(ctx))
 
-	desc, err := globalImageStreamer.getImageDescriptor(ref, contextOptions)
+	desc, err := globalImageStreamer.getImageDescriptorWithFailover(loc, ref.Identifier(), contextOptions)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "获取镜像信息失败: " + err.Error()})
 		return

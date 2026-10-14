@@ -1,4 +1,4 @@
-﻿---
+---
 title: 环境变量
 description: HubProxy 支持的环境变量说明。
 ---
@@ -21,6 +21,11 @@ description: HubProxy 支持的环境变量说明。
 | `IP_BLACKLIST` | `[security].blackList` | 追加封禁 IP，逗号分隔 |
 | `ACCESS_PROXY` | `[access].proxy` | 上游 SOCKS5 代理地址 |
 | `MAX_IMAGES` | `[download].maxImages` | 批量离线镜像数量上限 |
+| `DOCKER_HUB_UPSTREAMS` | `[upstream].dockerHubUpstreams` | Docker Hub 上游列表，逗号分隔，按优先级排序 |
+| `UPSTREAM_FAILURE_THRESHOLD` | `[upstream].failureThreshold` | 连续失败多少次后摘除上游 |
+| `UPSTREAM_HEALTH_CHECK_ENABLED` | `[upstream].healthCheckEnabled` | 是否主动探测已摘除的上游（`true`/`false`） |
+
+其余故障切换参数（`cooldown`、`healthCheckInterval`、`probeTimeout`）与各 Registry 的 `upstreams` 列表仅支持配置文件修改，见 [config.toml 参考](/configuration/reference/#upstream)。
 
 ## 示例
 

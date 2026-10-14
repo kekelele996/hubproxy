@@ -1,4 +1,4 @@
-﻿---
+---
 title: config.toml Reference
 description: Complete reference for the HubProxy configuration file.
 ---
@@ -55,18 +55,48 @@ Wildcards supported: `owner/*`, `*/repo-name`.
 |-----|------|---------|-------------|
 | `maxImages` | int | `10` | Max images per batch offline download |
 
+## [upstream]
+
+Upstream failover. When an upstream connection fails, times out, or returns 5xx, the next upstream in priority order is tried automatically; traffic switches back after the upstream recovers.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `dockerHubUpstreams` | string[] | `["registry-1.docker.io"]` | Docker Hub upstreams in priority order |
+| `failureThreshold` | int | `3` | Consecutive failures before an upstream is removed |
+| `cooldown` | duration | `"30s"` | Cooldown after removal; half-open probing starts afterwards |
+| `healthCheckEnabled` | bool | `true` | Actively probe removed upstreams (`/v2/`) |
+| `healthCheckInterval` | duration | `"10s"` | Active health check interval |
+| `probeTimeout` | duration | `"5s"` | Per-probe timeout |
+
+```toml
+[upstream]
+# Prefer a mirror, fall back to the official registry, then switch back
+dockerHubUpstreams = ["docker.m.example.com", "registry-1.docker.io"]
+failureThreshold = 3
+cooldown = "30s"
+healthCheckEnabled = true
+```
+
+Failover notes:
+
+- Connection failures, timeouts, 429/5xx trigger a switch; 404 (missing image/layer) is also tried on the next mirror (a pull-through cache may not have synced yet). 404 is returned only when every mirror misses it, and 404 never trips the circuit breaker.
+- 401/403 (auth problems) and malformed requests are returned directly without retrying other mirrors.
+- Each request gets an upstream candidate snapshot when it starts, so removing or recovering an upstream never interrupts in-flight downloads. Blob streams may switch transparently before the first byte; once bytes flow, the current upstream is pinned to keep the stream intact.
+- Recovery is detected either by half-open probing after cooldown or by background probes when `healthCheckEnabled` is on.
+
 ## [registries]
 
 Per-registry keys:
 
 | Key | Description |
 |-----|-------------|
-| `upstream` | Upstream registry host |
+| `upstreams` | Upstream registry hosts in priority order, with failover |
+| `upstream` | Single upstream host (legacy; appended to `upstreams` and de-duplicated) |
 | `authHost` | Auth endpoint (for token request matching) |
 | `authType` | Auth type label (`anonymous` / `github` / `google` / `quay`) |
 | `enabled` | Enable or disable |
 
-Defaults include `ghcr.io`, `gcr.io`, `quay.io`, `registry.k8s.io`. Docker Hub always proxies to `registry-1.docker.io` and is not configured here.
+Defaults include `ghcr.io`, `gcr.io`, `quay.io`, `registry.k8s.io`. Docker Hub upstreams are configured in [`[upstream]`](#upstream) and default to `registry-1.docker.io`.
 
 :::note
 All registries currently use anonymous pulls (`authn.Anonymous`). `authType` labels the auth endpoint only — **GitHub tokens and Google service accounts are not yet implemented**, and client `Authorization` headers are not forwarded. **Private authenticated images cannot be pulled through HubProxy.**
@@ -93,7 +123,7 @@ Upstream token `expires_in` is used for token cache (5-minute safety margin, min
 
 | Path | Description |
 |------|-------------|
-| `GET /ready` | Health check — returns `ready`, `version`, `uptime_sec`, etc. (**counts toward** rate limit) |
+| `GET /ready` | Health check — returns `ready`, `version`, `uptime_sec`, and per-pool `upstreams` health (**counts toward** rate limit) |
 | `GET /api/search?q=...` | Docker Hub image search |
 | `GET /api/tags/:namespace/:name` | Image tag list |
 | `GET /api/image/info?image=...` | Image metadata |

@@ -13,10 +13,38 @@ import (
 
 // RegistryMapping Registry映射配置
 type RegistryMapping struct {
-	Upstream string `toml:"upstream"`
-	AuthHost string `toml:"authHost"`
-	AuthType string `toml:"authType"`
-	Enabled  bool   `toml:"enabled"`
+	Upstream  string   `toml:"upstream"`
+	Upstreams []string `toml:"upstreams"`
+	AuthHost  string   `toml:"authHost"`
+	AuthType  string   `toml:"authType"`
+	Enabled   bool     `toml:"enabled"`
+}
+
+// UpstreamList 返回按优先级排序、去重后的上游地址列表。
+// 优先使用 upstreams 列表，同时兼容旧的单个 upstream 配置。
+func (m RegistryMapping) UpstreamList() []string {
+	return NormalizeUpstreamHosts(append(append([]string(nil), m.Upstreams...), m.Upstream))
+}
+
+// NormalizeUpstreamHosts 规范化上游主机名：去除协议头与尾部斜杠、去空白、去重并保留顺序。
+func NormalizeUpstreamHosts(hosts []string) []string {
+	seen := make(map[string]struct{}, len(hosts))
+	result := make([]string, 0, len(hosts))
+	for _, host := range hosts {
+		host = strings.TrimSpace(host)
+		host = strings.TrimPrefix(host, "https://")
+		host = strings.TrimPrefix(host, "http://")
+		host = strings.TrimSuffix(host, "/")
+		if host == "" {
+			continue
+		}
+		if _, exists := seen[host]; exists {
+			continue
+		}
+		seen[host] = struct{}{}
+		result = append(result, host)
+	}
+	return result
 }
 
 // AppConfig 应用配置结构体
@@ -48,6 +76,21 @@ type AppConfig struct {
 	Download struct {
 		MaxImages int `toml:"maxImages"`
 	} `toml:"download"`
+
+	Upstream struct {
+		// DockerHubUpstreams Docker Hub 上游列表，按优先级排序，第一个恢复后自动切回
+		DockerHubUpstreams []string `toml:"dockerHubUpstreams"`
+		// FailureThreshold 连续失败多少次后摘除上游
+		FailureThreshold int `toml:"failureThreshold"`
+		// Cooldown 上游被摘除后的冷却时间，冷却结束后放入半开状态试探
+		Cooldown string `toml:"cooldown"`
+		// HealthCheckEnabled 是否主动探测已摘除的上游
+		HealthCheckEnabled bool `toml:"healthCheckEnabled"`
+		// HealthCheckInterval 主动健康检查间隔
+		HealthCheckInterval string `toml:"healthCheckInterval"`
+		// ProbeTimeout 单次健康检查超时
+		ProbeTimeout string `toml:"probeTimeout"`
+	} `toml:"upstream"`
 
 	Registries map[string]RegistryMapping `toml:"registries"`
 
@@ -110,6 +153,21 @@ func DefaultConfig() *AppConfig {
 			MaxImages int `toml:"maxImages"`
 		}{
 			MaxImages: 10,
+		},
+		Upstream: struct {
+			DockerHubUpstreams  []string `toml:"dockerHubUpstreams"`
+			FailureThreshold    int      `toml:"failureThreshold"`
+			Cooldown            string   `toml:"cooldown"`
+			HealthCheckEnabled  bool     `toml:"healthCheckEnabled"`
+			HealthCheckInterval string   `toml:"healthCheckInterval"`
+			ProbeTimeout        string   `toml:"probeTimeout"`
+		}{
+			DockerHubUpstreams:  []string{"registry-1.docker.io"},
+			FailureThreshold:    3,
+			Cooldown:            "30s",
+			HealthCheckEnabled:  true,
+			HealthCheckInterval: "10s",
+			ProbeTimeout:        "5s",
 		},
 		Registries: map[string]RegistryMapping{
 			"ghcr.io": {
@@ -178,6 +236,7 @@ func GetConfig() *AppConfig {
 	configCopy.Security.BlackList = append([]string(nil), appConfig.Security.BlackList...)
 	configCopy.Access.WhiteList = append([]string(nil), appConfig.Access.WhiteList...)
 	configCopy.Access.BlackList = append([]string(nil), appConfig.Access.BlackList...)
+	configCopy.Upstream.DockerHubUpstreams = append([]string(nil), appConfig.Upstream.DockerHubUpstreams...)
 	appConfigLock.RUnlock()
 
 	cachedConfig = &configCopy
@@ -217,9 +276,30 @@ func LoadConfig() error {
 	}
 
 	overrideFromEnv(cfg)
+	normalizeUpstreamConfig(cfg)
 	setConfig(cfg)
 
 	return nil
+}
+
+// normalizeUpstreamConfig 规范化上游故障切换配置，补全缺失的默认值。
+func normalizeUpstreamConfig(cfg *AppConfig) {
+	cfg.Upstream.DockerHubUpstreams = NormalizeUpstreamHosts(cfg.Upstream.DockerHubUpstreams)
+	if len(cfg.Upstream.DockerHubUpstreams) == 0 {
+		cfg.Upstream.DockerHubUpstreams = []string{"registry-1.docker.io"}
+	}
+	if cfg.Upstream.FailureThreshold <= 0 {
+		cfg.Upstream.FailureThreshold = 3
+	}
+	if strings.TrimSpace(cfg.Upstream.Cooldown) == "" {
+		cfg.Upstream.Cooldown = "30s"
+	}
+	if strings.TrimSpace(cfg.Upstream.HealthCheckInterval) == "" {
+		cfg.Upstream.HealthCheckInterval = "10s"
+	}
+	if strings.TrimSpace(cfg.Upstream.ProbeTimeout) == "" {
+		cfg.Upstream.ProbeTimeout = "5s"
+	}
 }
 
 // overrideFromEnv 从环境变量覆盖配置
@@ -273,6 +353,20 @@ func overrideFromEnv(cfg *AppConfig) {
 	if val := os.Getenv("MAX_IMAGES"); val != "" {
 		if maxImages, err := strconv.Atoi(val); err == nil && maxImages > 0 {
 			cfg.Download.MaxImages = maxImages
+		}
+	}
+
+	if val, ok := os.LookupEnv("DOCKER_HUB_UPSTREAMS"); ok {
+		cfg.Upstream.DockerHubUpstreams = NormalizeUpstreamHosts(strings.Split(val, ","))
+	}
+	if val := os.Getenv("UPSTREAM_FAILURE_THRESHOLD"); val != "" {
+		if threshold, err := strconv.Atoi(val); err == nil && threshold > 0 {
+			cfg.Upstream.FailureThreshold = threshold
+		}
+	}
+	if val, ok := os.LookupEnv("UPSTREAM_HEALTH_CHECK_ENABLED"); ok {
+		if enabled, err := strconv.ParseBool(val); err == nil {
+			cfg.Upstream.HealthCheckEnabled = enabled
 		}
 	}
 }

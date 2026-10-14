@@ -29,8 +29,8 @@ func newTestRouter(t *testing.T, configBody string) *gin.Engine {
 	}
 
 	utils.InitHTTPClients()
+	utils.InitUpstreamManager()
 	globalLimiter = utils.InitGlobalLimiter()
-	handlers.InitDockerProxy()
 	handlers.InitImageStreamer()
 	handlers.InitDebouncer()
 
@@ -62,6 +62,29 @@ func TestReadyRoute(t *testing.T) {
 	}
 	if got["ready"] != true || got["service"] != "hubproxy" {
 		t.Fatalf("unexpected ready response: %#v", got)
+	}
+}
+
+func TestReadyRouteIncludesUpstreamHealth(t *testing.T) {
+	router := newTestRouter(t, "")
+
+	w := performRequest(router, http.MethodGet, "/ready", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", w.Code, w.Body.String())
+	}
+
+	var got struct {
+		Upstreams map[string][]map[string]any `json:"upstreams"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	pool, ok := got.Upstreams["docker.io"]
+	if !ok || len(pool) != 1 {
+		t.Fatalf("docker.io 上游池缺失或异常: %#v", got.Upstreams)
+	}
+	if pool[0]["host"] != "registry-1.docker.io" || pool[0]["healthy"] != true {
+		t.Fatalf("默认上游状态异常: %#v", pool[0])
 	}
 }
 

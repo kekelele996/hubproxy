@@ -122,8 +122,8 @@ func main() {
 	}
 
 	utils.InitHTTPClients()
+	utils.InitUpstreamManager()
 	globalLimiter = utils.InitGlobalLimiter()
-	handlers.InitDockerProxy()
 	handlers.InitImageStreamer()
 	handlers.InitDebouncer()
 
@@ -133,6 +133,10 @@ func main() {
 	fmt.Printf("HubProxy 启动成功\n")
 	fmt.Printf("监听地址: %s:%d\n", cfg.Server.Host, cfg.Server.Port)
 	fmt.Printf("限流配置: %d请求/%g小时\n", cfg.RateLimit.RequestLimit, cfg.RateLimit.PeriodHours)
+	if utils.GlobalUpstreamManager != nil {
+		fmt.Printf("上游故障切换: %d 个池, Docker Hub 上游 %d 个\n",
+			len(utils.GlobalUpstreamManager.PoolNames()), len(cfg.Upstream.DockerHubUpstreams))
+	}
 	if cfg.Server.EnableH2C {
 		fmt.Printf("H2c: 已启用\n")
 	}
@@ -187,6 +191,14 @@ func getUptimeInfo() (time.Duration, float64, string) {
 func initHealthRoutes(router *gin.Engine) {
 	router.GET("/ready", func(c *gin.Context) {
 		_, uptimeSec, uptimeHuman := getUptimeInfo()
+
+		upstreams := gin.H{}
+		if manager := utils.GlobalUpstreamManager; manager != nil {
+			for _, pool := range manager.PoolNames() {
+				upstreams[pool] = manager.PoolStatus(pool)
+			}
+		}
+
 		c.JSON(http.StatusOK, gin.H{
 			"ready":           true,
 			"service":         "hubproxy",
@@ -194,6 +206,7 @@ func initHealthRoutes(router *gin.Engine) {
 			"start_time_unix": serviceStartTime.Unix(),
 			"uptime_sec":      uptimeSec,
 			"uptime_human":    uptimeHuman,
+			"upstreams":       upstreams,
 		})
 	})
 }

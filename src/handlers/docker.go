@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,20 +10,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/go-containerregistry/pkg/authn"
-	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"hubproxy/config"
 	"hubproxy/utils"
 )
-
-// DockerProxy Docker代理配置
-type DockerProxy struct {
-	registry name.Registry
-	options  []remote.Option
-}
-
-var dockerProxy *DockerProxy
 
 // RegistryDetector Registry检测器
 type RegistryDetector struct{}
@@ -66,26 +56,6 @@ func (rd *RegistryDetector) getRegistryMapping(domain string) (config.RegistryMa
 
 var registryDetector = &RegistryDetector{}
 
-// InitDockerProxy 初始化Docker代理
-func InitDockerProxy() {
-	registry, err := name.NewRegistry("registry-1.docker.io")
-	if err != nil {
-		fmt.Printf("创建Docker registry失败: %v\n", err)
-		return
-	}
-
-	options := []remote.Option{
-		remote.WithAuth(authn.Anonymous),
-		remote.WithUserAgent("hubproxy/go-containerregistry"),
-		remote.WithTransport(utils.GetGlobalHTTPClient().Transport),
-	}
-
-	dockerProxy = &DockerProxy{
-		registry: registry,
-		options:  options,
-	}
-}
-
 // ProxyDockerRegistryGin 标准Docker Registry API v2代理
 func ProxyDockerRegistryGin(c *gin.Context) {
 	path := c.Request.URL.Path
@@ -108,7 +78,7 @@ func handleRegistryRequest(c *gin.Context, path string) {
 
 	if registryDomain, remainingPath := registryDetector.detectRegistryDomain(c, pathWithoutV2); registryDomain != "" {
 		if registryDetector.isRegistryEnabled(registryDomain) {
-			handleMultiRegistryRequest(c, registryDomain, remainingPath)
+			handleConfiguredRegistryRequest(c, registryDomain, remainingPath)
 			return
 		}
 	}
@@ -129,15 +99,45 @@ func handleRegistryRequest(c *gin.Context, path string) {
 		return
 	}
 
-	imageRef := fmt.Sprintf("%s/%s", dockerProxy.registry.Name(), imageName)
+	cfg := config.GetConfig()
+	loc := locatorForRegistry(utils.DockerHubPool, cfg.Upstream.DockerHubUpstreams, imageName)
+	dispatchRegistryRequest(c, loc, imageName, apiType, reference)
+}
 
+// handleConfiguredRegistryRequest 处理已配置第三方Registry的请求
+func handleConfiguredRegistryRequest(c *gin.Context, registryDomain, remainingPath string) {
+	mapping, exists := registryDetector.getRegistryMapping(registryDomain)
+	if !exists {
+		c.String(http.StatusBadRequest, "Registry not configured")
+		return
+	}
+
+	imageName, apiType, reference := parseRegistryPath(remainingPath)
+	if imageName == "" || apiType == "" {
+		c.String(http.StatusBadRequest, "Invalid path format")
+		return
+	}
+
+	fullImageName := registryDomain + "/" + imageName
+	if allowed, reason := utils.GlobalAccessController.CheckDockerAccess(fullImageName); !allowed {
+		fmt.Printf("镜像 %s 访问被拒绝: %s\n", fullImageName, reason)
+		c.String(http.StatusForbidden, "镜像访问被限制")
+		return
+	}
+
+	loc := locatorForRegistry(registryDomain, mapping.UpstreamList(), imageName)
+	dispatchRegistryRequest(c, loc, imageName, apiType, reference)
+}
+
+// dispatchRegistryRequest 按 API 类型分发请求
+func dispatchRegistryRequest(c *gin.Context, loc refLocator, imageName, apiType, reference string) {
 	switch apiType {
 	case "manifests":
-		handleManifestRequest(c, imageRef, reference)
+		handleManifestFailover(c, loc, reference)
 	case "blobs":
-		handleBlobRequest(c, imageRef, reference)
+		handleBlobFailover(c, loc, reference)
 	case "tags":
-		handleTagsRequest(c, imageRef)
+		handleTagsFailover(c, loc)
 	default:
 		c.String(http.StatusNotFound, "API endpoint not found")
 	}
@@ -169,10 +169,28 @@ func parseRegistryPath(path string) (imageName, apiType, reference string) {
 	return "", "", ""
 }
 
-// handleManifestRequest 处理manifest请求
-func handleManifestRequest(c *gin.Context, imageRef, reference string) {
+// logicalImageRef 返回与具体上游无关的逻辑镜像名，用于缓存 key
+func logicalImageRef(loc refLocator) string {
+	return loc.pool + "/" + loc.repo
+}
+
+// writeUpstreamError 统一映射故障切换后的错误：所有上游不可用返回 502，其余返回 404。
+func writeUpstreamError(c *gin.Context, err error, notFoundMessage string) {
+	if errors.Is(err, errAllUpstreamsUnavailable) {
+		fmt.Printf("所有上游均不可用: %v\n", err)
+		c.String(http.StatusBadGateway, "所有上游暂时不可用，请稍后重试")
+		return
+	}
+	fmt.Printf("上游请求失败: %v\n", err)
+	c.String(http.StatusNotFound, notFoundMessage)
+}
+
+// handleManifestFailover 处理manifest请求（自动故障切换）
+func handleManifestFailover(c *gin.Context, loc refLocator, reference string) {
+	cacheRef := logicalImageRef(loc)
+
 	if utils.IsCacheEnabled() && c.Request.Method == http.MethodGet {
-		cacheKey := utils.BuildManifestCacheKey(imageRef, reference)
+		cacheKey := utils.BuildManifestCacheKey(cacheRef, reference)
 
 		if cachedItem := utils.GlobalCache.Get(cacheKey); cachedItem != nil {
 			utils.WriteCachedResponse(c, cachedItem)
@@ -180,26 +198,12 @@ func handleManifestRequest(c *gin.Context, imageRef, reference string) {
 		}
 	}
 
-	var ref name.Reference
-	var err error
-
-	if strings.HasPrefix(reference, "sha256:") {
-		ref, err = name.NewDigest(fmt.Sprintf("%s@%s", imageRef, reference))
-	} else {
-		ref, err = name.NewTag(fmt.Sprintf("%s:%s", imageRef, reference))
-	}
-
-	if err != nil {
-		fmt.Printf("解析镜像引用失败: %v\n", err)
-		c.String(http.StatusBadRequest, "Invalid reference")
-		return
-	}
+	options := baseRemoteOptions()
 
 	if c.Request.Method == http.MethodHead {
-		desc, err := remote.Head(ref, dockerProxy.options...)
+		desc, err := remoteHeadWithFailover(loc, reference, options)
 		if err != nil {
-			fmt.Printf("HEAD请求失败: %v\n", err)
-			c.String(http.StatusNotFound, "Manifest not found")
+			writeUpstreamError(c, err, "Manifest not found")
 			return
 		}
 
@@ -207,67 +211,51 @@ func handleManifestRequest(c *gin.Context, imageRef, reference string) {
 		c.Header("Docker-Content-Digest", desc.Digest.String())
 		c.Header("Content-Length", fmt.Sprintf("%d", desc.Size))
 		c.Status(http.StatusOK)
-	} else {
-		desc, err := remote.Get(ref, dockerProxy.options...)
-		if err != nil {
-			fmt.Printf("GET请求失败: %v\n", err)
-			c.String(http.StatusNotFound, "Manifest not found")
-			return
-		}
-
-		headers := map[string]string{
-			"Docker-Content-Digest": desc.Digest.String(),
-			"Content-Length":        fmt.Sprintf("%d", len(desc.Manifest)),
-		}
-
-		if utils.IsCacheEnabled() {
-			cacheKey := utils.BuildManifestCacheKey(imageRef, reference)
-			ttl := utils.GetManifestTTL(reference)
-			utils.GlobalCache.Set(cacheKey, desc.Manifest, string(desc.MediaType), headers, ttl)
-		}
-
-		c.Header("Content-Type", string(desc.MediaType))
-		for key, value := range headers {
-			c.Header(key, value)
-		}
-
-		c.Data(http.StatusOK, string(desc.MediaType), desc.Manifest)
+		return
 	}
+
+	desc, err := remoteGetWithFailover(loc, reference, options)
+	if err != nil {
+		writeUpstreamError(c, err, "Manifest not found")
+		return
+	}
+
+	headers := map[string]string{
+		"Docker-Content-Digest": desc.Digest.String(),
+		"Content-Length":        fmt.Sprintf("%d", len(desc.Manifest)),
+	}
+
+	if utils.IsCacheEnabled() {
+		cacheKey := utils.BuildManifestCacheKey(cacheRef, reference)
+		ttl := utils.GetManifestTTL(reference)
+		utils.GlobalCache.Set(cacheKey, desc.Manifest, string(desc.MediaType), headers, ttl)
+	}
+
+	c.Header("Content-Type", string(desc.MediaType))
+	for key, value := range headers {
+		c.Header(key, value)
+	}
+
+	c.Data(http.StatusOK, string(desc.MediaType), desc.Manifest)
 }
 
-// handleBlobRequest 处理blob请求
-func handleBlobRequest(c *gin.Context, imageRef, digest string) {
-	digestRef, err := name.NewDigest(fmt.Sprintf("%s@%s", imageRef, digest))
-	if err != nil {
-		fmt.Printf("解析digest引用失败: %v\n", err)
+// handleBlobFailover 处理blob（layer）请求，首字节前自动切换上游
+func handleBlobFailover(c *gin.Context, loc refLocator, digest string) {
+	// 提前校验 digest 引用格式，格式错误直接返回 400
+	if _, err := loc.rebasedDigestRef(loc.hosts[0], digest); err != nil {
 		c.String(http.StatusBadRequest, "Invalid digest reference")
 		return
 	}
 
-	layer, err := remote.Layer(digestRef, dockerProxy.options...)
+	reader, err := openBlobWithFailover(loc, digest, true, baseRemoteOptions())
 	if err != nil {
-		fmt.Printf("获取layer失败: %v\n", err)
-		c.String(http.StatusNotFound, "Layer not found")
-		return
-	}
-
-	size, err := layer.Size()
-	if err != nil {
-		fmt.Printf("获取layer大小失败: %v\n", err)
-		c.String(http.StatusInternalServerError, "Failed to get layer size")
-		return
-	}
-
-	reader, err := layer.Compressed()
-	if err != nil {
-		fmt.Printf("获取layer内容失败: %v\n", err)
-		c.String(http.StatusInternalServerError, "Failed to get layer content")
+		writeUpstreamError(c, err, "Layer not found")
 		return
 	}
 	defer reader.Close()
 
 	c.Header("Content-Type", "application/octet-stream")
-	c.Header("Content-Length", fmt.Sprintf("%d", size))
+	c.Header("Content-Length", fmt.Sprintf("%d", reader.Size()))
 	c.Header("Docker-Content-Digest", digest)
 
 	c.Status(http.StatusOK)
@@ -276,24 +264,16 @@ func handleBlobRequest(c *gin.Context, imageRef, digest string) {
 	}
 }
 
-// handleTagsRequest 处理tags列表请求
-func handleTagsRequest(c *gin.Context, imageRef string) {
-	repo, err := name.NewRepository(imageRef)
+// handleTagsFailover 处理tags列表请求（自动故障切换）
+func handleTagsFailover(c *gin.Context, loc refLocator) {
+	tags, err := remoteListWithFailover(loc, baseRemoteOptions())
 	if err != nil {
-		fmt.Printf("解析repository失败: %v\n", err)
-		c.String(http.StatusBadRequest, "Invalid repository")
-		return
-	}
-
-	tags, err := remote.List(repo, dockerProxy.options...)
-	if err != nil {
-		fmt.Printf("获取tags失败: %v\n", err)
-		c.String(http.StatusNotFound, "Tags not found")
+		writeUpstreamError(c, err, "Tags not found")
 		return
 	}
 
 	response := map[string]interface{}{
-		"name": strings.TrimPrefix(imageRef, dockerProxy.registry.Name()+"/"),
+		"name": loc.repo,
 		"tags": tags,
 	}
 
@@ -456,192 +436,4 @@ func rewriteAuthHeader(authHeader, proxyHost string) string {
 	authHeader = strings.ReplaceAll(authHeader, "https://auth.docker.io", "http://"+proxyHost)
 
 	return authHeader
-}
-
-// handleMultiRegistryRequest 处理多Registry请求
-func handleMultiRegistryRequest(c *gin.Context, registryDomain, remainingPath string) {
-	mapping, exists := registryDetector.getRegistryMapping(registryDomain)
-	if !exists {
-		c.String(http.StatusBadRequest, "Registry not configured")
-		return
-	}
-
-	imageName, apiType, reference := parseRegistryPath(remainingPath)
-	if imageName == "" || apiType == "" {
-		c.String(http.StatusBadRequest, "Invalid path format")
-		return
-	}
-
-	fullImageName := registryDomain + "/" + imageName
-	if allowed, reason := utils.GlobalAccessController.CheckDockerAccess(fullImageName); !allowed {
-		fmt.Printf("镜像 %s 访问被拒绝: %s\n", fullImageName, reason)
-		c.String(http.StatusForbidden, "镜像访问被限制")
-		return
-	}
-
-	upstreamImageRef := fmt.Sprintf("%s/%s", mapping.Upstream, imageName)
-
-	switch apiType {
-	case "manifests":
-		handleUpstreamManifestRequest(c, upstreamImageRef, reference, mapping)
-	case "blobs":
-		handleUpstreamBlobRequest(c, upstreamImageRef, reference, mapping)
-	case "tags":
-		handleUpstreamTagsRequest(c, upstreamImageRef, mapping)
-	default:
-		c.String(http.StatusNotFound, "API endpoint not found")
-	}
-}
-
-// handleUpstreamManifestRequest 处理上游Registry的manifest请求
-func handleUpstreamManifestRequest(c *gin.Context, imageRef, reference string, mapping config.RegistryMapping) {
-	if utils.IsCacheEnabled() && c.Request.Method == http.MethodGet {
-		cacheKey := utils.BuildManifestCacheKey(imageRef, reference)
-
-		if cachedItem := utils.GlobalCache.Get(cacheKey); cachedItem != nil {
-			utils.WriteCachedResponse(c, cachedItem)
-			return
-		}
-	}
-
-	var ref name.Reference
-	var err error
-
-	if strings.HasPrefix(reference, "sha256:") {
-		ref, err = name.NewDigest(fmt.Sprintf("%s@%s", imageRef, reference))
-	} else {
-		ref, err = name.NewTag(fmt.Sprintf("%s:%s", imageRef, reference))
-	}
-
-	if err != nil {
-		fmt.Printf("解析镜像引用失败: %v\n", err)
-		c.String(http.StatusBadRequest, "Invalid reference")
-		return
-	}
-
-	options := createUpstreamOptions(mapping)
-
-	if c.Request.Method == http.MethodHead {
-		desc, err := remote.Head(ref, options...)
-		if err != nil {
-			fmt.Printf("HEAD请求失败: %v\n", err)
-			c.String(http.StatusNotFound, "Manifest not found")
-			return
-		}
-
-		c.Header("Content-Type", string(desc.MediaType))
-		c.Header("Docker-Content-Digest", desc.Digest.String())
-		c.Header("Content-Length", fmt.Sprintf("%d", desc.Size))
-		c.Status(http.StatusOK)
-	} else {
-		desc, err := remote.Get(ref, options...)
-		if err != nil {
-			fmt.Printf("GET请求失败: %v\n", err)
-			c.String(http.StatusNotFound, "Manifest not found")
-			return
-		}
-
-		headers := map[string]string{
-			"Docker-Content-Digest": desc.Digest.String(),
-			"Content-Length":        fmt.Sprintf("%d", len(desc.Manifest)),
-		}
-
-		if utils.IsCacheEnabled() {
-			cacheKey := utils.BuildManifestCacheKey(imageRef, reference)
-			ttl := utils.GetManifestTTL(reference)
-			utils.GlobalCache.Set(cacheKey, desc.Manifest, string(desc.MediaType), headers, ttl)
-		}
-
-		c.Header("Content-Type", string(desc.MediaType))
-		for key, value := range headers {
-			c.Header(key, value)
-		}
-
-		c.Data(http.StatusOK, string(desc.MediaType), desc.Manifest)
-	}
-}
-
-// handleUpstreamBlobRequest 处理上游Registry的blob请求
-func handleUpstreamBlobRequest(c *gin.Context, imageRef, digest string, mapping config.RegistryMapping) {
-	digestRef, err := name.NewDigest(fmt.Sprintf("%s@%s", imageRef, digest))
-	if err != nil {
-		fmt.Printf("解析digest引用失败: %v\n", err)
-		c.String(http.StatusBadRequest, "Invalid digest reference")
-		return
-	}
-
-	options := createUpstreamOptions(mapping)
-	layer, err := remote.Layer(digestRef, options...)
-	if err != nil {
-		fmt.Printf("获取layer失败: %v\n", err)
-		c.String(http.StatusNotFound, "Layer not found")
-		return
-	}
-
-	size, err := layer.Size()
-	if err != nil {
-		fmt.Printf("获取layer大小失败: %v\n", err)
-		c.String(http.StatusInternalServerError, "Failed to get layer size")
-		return
-	}
-
-	reader, err := layer.Compressed()
-	if err != nil {
-		fmt.Printf("获取layer内容失败: %v\n", err)
-		c.String(http.StatusInternalServerError, "Failed to get layer content")
-		return
-	}
-	defer reader.Close()
-
-	c.Header("Content-Type", "application/octet-stream")
-	c.Header("Content-Length", fmt.Sprintf("%d", size))
-	c.Header("Docker-Content-Digest", digest)
-
-	c.Status(http.StatusOK)
-	if _, err := io.Copy(c.Writer, reader); err != nil {
-		fmt.Printf("复制layer内容失败: %v\n", err)
-	}
-}
-
-// handleUpstreamTagsRequest 处理上游Registry的tags请求
-func handleUpstreamTagsRequest(c *gin.Context, imageRef string, mapping config.RegistryMapping) {
-	repo, err := name.NewRepository(imageRef)
-	if err != nil {
-		fmt.Printf("解析repository失败: %v\n", err)
-		c.String(http.StatusBadRequest, "Invalid repository")
-		return
-	}
-
-	options := createUpstreamOptions(mapping)
-	tags, err := remote.List(repo, options...)
-	if err != nil {
-		fmt.Printf("获取tags失败: %v\n", err)
-		c.String(http.StatusNotFound, "Tags not found")
-		return
-	}
-
-	response := map[string]interface{}{
-		"name": strings.TrimPrefix(imageRef, mapping.Upstream+"/"),
-		"tags": tags,
-	}
-
-	c.JSON(http.StatusOK, response)
-}
-
-// createUpstreamOptions 创建上游Registry选项
-func createUpstreamOptions(mapping config.RegistryMapping) []remote.Option {
-	options := []remote.Option{
-		remote.WithAuth(authn.Anonymous),
-		remote.WithUserAgent("hubproxy/go-containerregistry"),
-		remote.WithTransport(utils.GetGlobalHTTPClient().Transport),
-	}
-
-	// 预留将来不同Registry的差异化认证逻辑扩展点
-	switch mapping.AuthType {
-	case "github":
-	case "google":
-	case "quay":
-	}
-
-	return options
 }

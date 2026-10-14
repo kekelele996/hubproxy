@@ -53,13 +53,34 @@ proxy = ""
 # 批量下载离线镜像数量限制
 maxImages = 10
 
+# 上游故障切换配置
+[upstream]
+# Docker Hub 上游列表，按优先级排序：
+# 第一个可用时优先使用，故障时自动切换到下一个，恢复后自动切回。
+# 可配置多个镜像加速器，末尾可保留官方地址用于直连兜底。
+dockerHubUpstreams = [
+    "registry-1.docker.io"
+]
+# 连续失败多少次后摘除上游
+failureThreshold = 3
+# 摘除后的冷却时间，冷却结束后进入半开状态试探
+cooldown = "30s"
+# 是否主动探测已摘除的上游（探测 /v2/ 端点，恢复后立即切回）
+healthCheckEnabled = true
+# 主动健康检查间隔
+healthCheckInterval = "10s"
+# 单次健康检查超时
+probeTimeout = "5s"
+
 # Registry映射配置，支持多种镜像仓库上游
 [registries]
 
 # GitHub Container Registry
 [registries."ghcr.io"]
 upstream = "ghcr.io"
-authHost = "ghcr.io/token" 
+# 可配置多个备用上游，按优先级排序；旧的 upstream 会自动追加为最后一个候选
+# upstreams = ["ghcr-mirror.example.com"]
+authHost = "ghcr.io/token"
 authType = "github"
 enabled = true
 
