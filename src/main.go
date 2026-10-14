@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"fmt"
 	"log"
 	"mime"
 	"net/http"
+	"os"
+	"os/signal"
 	"path"
 	"strings"
 	"time"
@@ -27,6 +30,10 @@ var (
 )
 
 var Version = "dev"
+
+// startSIGHUPReloader 在类 Unix 平台由 init 替换为真实实现（sighup_unix.go），
+// Windows 等平台保持空实现
+var startSIGHUPReloader = func(context.Context) {}
 
 func init() {
 	for ext, typ := range map[string]string{
@@ -129,6 +136,12 @@ func main() {
 
 	cfg := config.GetConfig()
 	router := buildRouter(cfg)
+
+	// 配置热更新：轮询配置文件变更（兜底），SIGHUP 可立即触发一次重载
+	reloadCtx, stopReloadWatcher := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stopReloadWatcher()
+	config.StartReloadWatcher(reloadCtx, config.DefaultConfigWatchInterval)
+	startSIGHUPReloader(reloadCtx)
 
 	fmt.Printf("HubProxy 启动成功\n")
 	fmt.Printf("监听地址: %s:%d\n", cfg.Server.Host, cfg.Server.Port)

@@ -1,31 +1,72 @@
 package utils
 
 import (
+	"fmt"
 	"net"
 	"net/http"
-	"os"
+	"net/url"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"hubproxy/config"
 )
 
-var (
-	globalHTTPClient *http.Client
-	searchHTTPClient *http.Client
-)
+// managedClients 一组按当前代理配置构建的 HTTP 客户端
+type managedClients struct {
+	proxy  string
+	global *http.Client
+	search *http.Client
+}
 
-// InitHTTPClients 初始化HTTP客户端
-func InitHTTPClients() {
-	cfg := config.GetConfig()
+var clientsHolder atomic.Pointer[managedClients]
 
-	if p := cfg.Access.Proxy; p != "" {
-		os.Setenv("HTTP_PROXY", p)
-		os.Setenv("HTTPS_PROXY", p)
+// dynamicGlobalTransport 始终委托给当前全局客户端的 Transport。
+// 启动时持有它的组件（Docker 代理、镜像下载器）无需重建，
+// 代理热更新后新请求自动走新连接，在途请求继续使用旧连接直到完成。
+type dynamicGlobalTransport struct{}
+
+func (dynamicGlobalTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return GetGlobalHTTPClient().Transport.RoundTrip(req)
+}
+
+// GlobalTransport 跟随代理配置热更新的稳定 Transport
+var GlobalTransport http.RoundTripper = dynamicGlobalTransport{}
+
+// parseProxyURL 解析上游代理地址，留空表示直连（返回 nil）
+func parseProxyURL(proxy string) (*url.URL, error) {
+	proxy = strings.TrimSpace(proxy)
+	if proxy == "" {
+		return nil, nil
 	}
 
-	globalHTTPClient = &http.Client{
+	u, err := url.Parse(proxy)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return nil, fmt.Errorf("无效的代理地址 %q", proxy)
+	}
+
+	switch u.Scheme {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return nil, fmt.Errorf("不支持的代理协议 %q（仅支持 http/https/socks5）", u.Scheme)
+	}
+
+	return u, nil
+}
+
+// buildHTTPClients 按配置中的代理地址构建 HTTP 客户端
+func buildHTTPClients(cfg *config.AppConfig) *managedClients {
+	proxyFunc := func(*http.Request) (*url.URL, error) { return nil, nil } // 默认直连
+
+	if u, err := parseProxyURL(cfg.Access.Proxy); err != nil {
+		fmt.Printf("警告: %v，本次将直连上游\n", err)
+	} else if u != nil {
+		proxyFunc = http.ProxyURL(u)
+	}
+
+	globalHTTPClient := &http.Client{
 		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
+			Proxy: proxyFunc,
 			DialContext: (&net.Dialer{
 				Timeout:   30 * time.Second,
 				KeepAlive: 30 * time.Second,
@@ -39,10 +80,10 @@ func InitHTTPClients() {
 		},
 	}
 
-	searchHTTPClient = &http.Client{
+	searchHTTPClient := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
+			Proxy: proxyFunc,
 			DialContext: (&net.Dialer{
 				Timeout:   5 * time.Second,
 				KeepAlive: 30 * time.Second,
@@ -54,14 +95,49 @@ func InitHTTPClients() {
 			DisableCompression:  false,
 		},
 	}
+
+	return &managedClients{
+		proxy:  strings.TrimSpace(cfg.Access.Proxy),
+		global: globalHTTPClient,
+		search: searchHTTPClient,
+	}
 }
 
-// GetGlobalHTTPClient 获取全局HTTP客户端
+// InitHTTPClients 初始化HTTP客户端，并在配置热加载时按需平滑切换代理
+func InitHTTPClients() {
+	clientsHolder.Store(buildHTTPClients(config.GetConfig()))
+
+	config.OnReload(func(cfg *config.AppConfig) {
+		proxy := strings.TrimSpace(cfg.Access.Proxy)
+		if current := clientsHolder.Load(); current != nil && current.proxy == proxy {
+			return
+		}
+
+		old := clientsHolder.Swap(buildHTTPClients(cfg))
+		if old != nil {
+			// 只关闭空闲连接；已经在途的请求继续持有旧 Transport 完成本次请求
+			if t, ok := old.global.Transport.(*http.Transport); ok {
+				t.CloseIdleConnections()
+			}
+			if t, ok := old.search.Transport.(*http.Transport); ok {
+				t.CloseIdleConnections()
+			}
+		}
+
+		if proxy == "" {
+			fmt.Printf("上游代理配置已更新: 已切换为直连\n")
+		} else {
+			fmt.Printf("上游代理配置已更新: %s\n", proxy)
+		}
+	})
+}
+
+// GetGlobalHTTPClient 获取当前HTTP客户端（代理热更新后自动返回新实例）
 func GetGlobalHTTPClient() *http.Client {
-	return globalHTTPClient
+	return clientsHolder.Load().global
 }
 
-// GetSearchHTTPClient 获取搜索HTTP客户端
+// GetSearchHTTPClient 获取搜索HTTP客户端（代理热更新后自动返回新实例）
 func GetSearchHTTPClient() *http.Client {
-	return searchHTTPClient
+	return clientsHolder.Load().search
 }

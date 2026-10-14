@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"strconv"
@@ -65,7 +67,19 @@ var (
 	configCacheTime  time.Time
 	configCacheTTL   = 5 * time.Second
 	configCacheMutex sync.RWMutex
+
+	// reloadHooks 配置成功热加载后触发的回调，各运行时组件在此平滑应用新配置
+	reloadHooksMu sync.RWMutex
+	reloadHooks   []func(*AppConfig)
+
+	// watcher 相关状态：lastWatchedBytes 记录上次已感知到的配置文件内容
+	watcherMu        sync.Mutex
+	lastWatchedBytes []byte
+	watcherStarted   bool
 )
+
+// DefaultConfigWatchInterval 配置文件变更轮询间隔
+const DefaultConfigWatchInterval = 3 * time.Second
 
 // DefaultConfig 返回默认配置
 func DefaultConfig() *AppConfig {
@@ -178,6 +192,12 @@ func GetConfig() *AppConfig {
 	configCopy.Security.BlackList = append([]string(nil), appConfig.Security.BlackList...)
 	configCopy.Access.WhiteList = append([]string(nil), appConfig.Access.WhiteList...)
 	configCopy.Access.BlackList = append([]string(nil), appConfig.Access.BlackList...)
+	if appConfig.Registries != nil {
+		configCopy.Registries = make(map[string]RegistryMapping, len(appConfig.Registries))
+		for domain, mapping := range appConfig.Registries {
+			configCopy.Registries[domain] = mapping
+		}
+	}
 	appConfigLock.RUnlock()
 
 	cachedConfig = &configCopy
@@ -205,21 +225,135 @@ func configFilePath() string {
 }
 
 func LoadConfig() error {
-	cfg := DefaultConfig()
+	cfg, fileData, err := readConfigFromFile()
+	if err != nil {
+		return err
+	}
+	if fileData == nil {
+		fmt.Printf("未找到配置文件 %s，使用默认配置\n", configFilePath())
+	}
+
+	setConfig(cfg)
+	setLastWatchedBytes(fileData)
+
+	return nil
+}
+
+// readConfigFromFile 读取并解析配置文件：默认值 -> TOML 覆盖 -> 环境变量覆盖。
+// 文件不存在时返回默认配置且 fileData 为 nil；解析失败时返回错误，由调用方决定保留旧配置。
+func readConfigFromFile() (cfg *AppConfig, fileData []byte, err error) {
+	cfg = DefaultConfig()
 	path := configFilePath()
 
-	if data, err := os.ReadFile(path); err == nil {
-		if err := toml.Unmarshal(data, cfg); err != nil {
-			return fmt.Errorf("解析配置文件 %s 失败: %v", path, err)
+	data, readErr := os.ReadFile(path)
+	if readErr == nil {
+		fileData = data
+		if parseErr := toml.Unmarshal(data, cfg); parseErr != nil {
+			return nil, nil, fmt.Errorf("解析配置文件 %s 失败: %v", path, parseErr)
 		}
-	} else {
-		fmt.Printf("未找到配置文件 %s，使用默认配置\n", path)
+	} else if !os.IsNotExist(readErr) {
+		// 文件存在但暂时不可读（权限、IO 错误等），不要用默认配置覆盖线上配置
+		return nil, nil, fmt.Errorf("读取配置文件 %s 失败: %v", path, readErr)
 	}
 
 	overrideFromEnv(cfg)
-	setConfig(cfg)
+	return cfg, fileData, nil
+}
 
+// ReloadConfig 重新读取配置文件并热更新到运行中的服务。
+// 解析或读取失败时保留当前配置继续服务，返回错误供调用方记录日志。
+func ReloadConfig() error {
+	cfg, fileData, err := readConfigFromFile()
+	if err != nil {
+		fmt.Printf("配置热加载失败，继续使用当前配置: %v\n", err)
+		return err
+	}
+
+	setConfig(cfg)
+	setLastWatchedBytes(fileData)
+	notifyReloadHooks(cfg)
+
+	fmt.Printf("配置已热加载并即时生效: %s\n", configFilePath())
 	return nil
+}
+
+// OnReload 注册配置热加载成功后的回调。回调在执行热加载的 goroutine 中同步执行，
+// 各组件应在回调内只做无阻塞的原子切换。
+func OnReload(hook func(*AppConfig)) {
+	if hook == nil {
+		return
+	}
+	reloadHooksMu.Lock()
+	reloadHooks = append(reloadHooks, hook)
+	reloadHooksMu.Unlock()
+}
+
+func notifyReloadHooks(cfg *AppConfig) {
+	reloadHooksMu.RLock()
+	hooks := make([]func(*AppConfig), 0, len(reloadHooks))
+	hooks = append(hooks, reloadHooks...)
+	reloadHooksMu.RUnlock()
+
+	for _, hook := range hooks {
+		hook(cfg)
+	}
+}
+
+// StartReloadWatcher 启动配置文件变更监听。文件内容发生变化时自动热加载，
+// 无需重启服务；解析失败时跳过本次变更并继续使用当前配置，待文件再次变化后重试。
+func StartReloadWatcher(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		interval = DefaultConfigWatchInterval
+	}
+
+	watcherMu.Lock()
+	if watcherStarted {
+		watcherMu.Unlock()
+		return
+	}
+	watcherStarted = true
+	watcherMu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				checkConfigFileChange()
+			}
+		}
+	}()
+}
+
+// checkConfigFileChange 比较配置文件内容与上次感知到的内容，变化则触发热加载
+func checkConfigFileChange() {
+	data, err := os.ReadFile(configFilePath())
+	if err != nil {
+		// 文件不存在或暂时不可读时跳过，等下一个周期再试
+		return
+	}
+
+	watcherMu.Lock()
+	unchanged := bytes.Equal(data, lastWatchedBytes)
+	watcherMu.Unlock()
+	if unchanged {
+		return
+	}
+
+	if reloadErr := ReloadConfig(); reloadErr != nil {
+		// 记录本次内容，避免同一份坏配置每个周期重复解析、刷屏日志
+		setLastWatchedBytes(data)
+	}
+}
+
+func setLastWatchedBytes(data []byte) {
+	watcherMu.Lock()
+	lastWatchedBytes = append(lastWatchedBytes[:0:0], data...)
+	watcherMu.Unlock()
 }
 
 // overrideFromEnv 从环境变量覆盖配置

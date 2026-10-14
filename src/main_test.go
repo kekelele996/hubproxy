@@ -177,6 +177,86 @@ enableFrontend = false
 	}
 }
 
+// reloadRunningConfig 覆写当前 CONFIG_PATH 指向的配置文件并热加载，不重建 router
+func reloadRunningConfig(t *testing.T, body string) {
+	t.Helper()
+	path := os.Getenv("CONFIG_PATH")
+	if path == "" {
+		t.Fatal("CONFIG_PATH 未设置")
+	}
+	if err := os.WriteFile(path, []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.ReloadConfig(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSettingsHotReloadWithoutRestart(t *testing.T) {
+	router := newTestRouter(t, "")
+
+	// 初始：镜像可下载
+	w := performRequest(router, http.MethodGet, "/api/image/download?image=alpine&mode=prepare", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("初始 alpine 应可下载, status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	// 1) 热加载资源黑名单：alpine 立即被拒，其他镜像不受影响
+	reloadRunningConfig(t, `
+[access]
+blackList = ["library/alpine"]
+`)
+	w = performRequest(router, http.MethodGet, "/api/image/download?image=alpine&mode=prepare", "")
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "黑名单") {
+		t.Fatalf("热加载后 alpine 应被镜像黑名单拒绝, status=%d body=%s", w.Code, w.Body.String())
+	}
+	w = performRequest(router, http.MethodGet, "/api/image/download?image=nginx&mode=prepare", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("不在黑名单的 nginx 应正常, status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	// 2) 热加载 IP 黑名单：测试客户端 IP 立即在限流中间件层被拒
+	reloadRunningConfig(t, `
+[access]
+blackList = ["library/alpine"]
+
+[security]
+blackList = ["192.0.2.1/32"]
+`)
+	w = performRequest(router, http.MethodGet, "/api/image/download?image=redis&mode=prepare", "")
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "限制访问") {
+		t.Fatalf("热加载后测试IP应被IP黑名单拒绝, status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	// 3) 清空全部名单后立即恢复（同一个 router、同一个服务进程）
+	reloadRunningConfig(t, "")
+	w = performRequest(router, http.MethodGet, "/api/image/download?image=busybox&mode=prepare", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("名单清空后 busybox 应立即恢复访问, status=%d body=%s", w.Code, w.Body.String())
+	}
+
+	// 4) 热加载限流额度：收紧到 1次/小时，新请求立即受 429 约束
+	w = performRequest(router, http.MethodGet, "/ready", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("额度收紧前 /ready 应正常, status=%d", w.Code)
+	}
+	reloadRunningConfig(t, `
+[rateLimit]
+requestLimit = 1
+periodHours = 1.0
+`)
+	gotTooManyRequests := false
+	for i := 0; i < 5; i++ {
+		if performRequest(router, http.MethodGet, "/ready", "").Code == http.StatusTooManyRequests {
+			gotTooManyRequests = true
+			break
+		}
+	}
+	if !gotTooManyRequests {
+		t.Fatal("限流额度热加载收紧后应出现 429")
+	}
+}
+
 func TestSearchServesSPAWhenFrontendEnabled(t *testing.T) {
 	router := newTestRouter(t, `
 [server]

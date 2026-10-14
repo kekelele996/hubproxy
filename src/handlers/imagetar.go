@@ -258,7 +258,7 @@ func NewImageStreamer(cfg *ImageStreamerConfig) *ImageStreamer {
 
 	remoteOptions := []remote.Option{
 		remote.WithAuth(authn.Anonymous),
-		remote.WithTransport(utils.GetGlobalHTTPClient().Transport),
+		remote.WithTransport(utils.GlobalTransport),
 	}
 
 	return &ImageStreamer{
