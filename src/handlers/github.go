@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -91,8 +92,58 @@ func CheckGitHubURL(u string) []string {
 	return nil
 }
 
+// isHeavyDownloadURL 判断URL是否为典型的大文件下载（发行版附件、源码包、HF模型/LFS文件）。
+// raw/blob 等常用于小文件和安装脚本的路径不排队，避免影响日常使用。
+func isHeavyDownloadURL(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+
+	host := strings.ToLower(parsed.Hostname())
+	path := parsed.Path
+
+	switch host {
+	case "github.com":
+		return strings.Contains(path, "/releases/download/") || strings.Contains(path, "/archive/")
+	case "huggingface.co":
+		return strings.Contains(path, "/resolve/")
+	case "cdn-lfs.hf.co":
+		return true
+	default:
+		return false
+	}
+}
+
+// downloadLabelFromURL 生成排队任务标签
+func downloadLabelFromURL(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "download"
+	}
+	path := parsed.Path
+	if len(path) > 48 {
+		path = path[:48]
+	}
+	return "download:" + parsed.Hostname() + path
+}
+
 // ProxyGitHubRequest 代理GitHub请求
 func ProxyGitHubRequest(c *gin.Context, u string) {
+	// 大文件下载先占用全局并发名额，小请求（API、raw脚本等）直接放行
+	if c.Request.Method == http.MethodGet && utils.QueueEnabled() && isHeavyDownloadURL(u) {
+		ip, userAgent := getClientIdentity(c)
+		ticket, err := utils.AcquireDownload(c.Request.Context(), downloadLabelFromURL(u), ip+"|"+userAgent)
+		if err != nil {
+			utils.WriteQueueError(c, err)
+			return
+		}
+		defer utils.ReleaseDownload(ticket)
+		if ticket != nil {
+			c.Header("X-Queue-Wait-Seconds", fmt.Sprintf("%.0f", ticket.WaitedSeconds()))
+		}
+	}
+
 	proxyGitHubWithRedirect(c, u, 0)
 }
 

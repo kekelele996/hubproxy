@@ -235,14 +235,48 @@ func handleManifestRequest(c *gin.Context, imageRef, reference string) {
 	}
 }
 
+// shortDigestLabel 生成简短的排队任务标签
+func shortDigestLabel(digest string) string {
+	if len(digest) > 19 {
+		digest = digest[:19]
+	}
+	return "blob:" + digest
+}
+
+// acquireDownloadSlot 大文件下载前先排队获取并发名额。
+// 返回 ok=false 时已向客户端写入排队错误响应，调用方应直接返回。
+func acquireDownloadSlot(c *gin.Context, label string) (*utils.Ticket, bool) {
+	if c.Request.Method != http.MethodGet || !utils.QueueEnabled() {
+		return nil, true
+	}
+
+	ip, userAgent := getClientIdentity(c)
+	ticket, err := utils.AcquireDownload(c.Request.Context(), label, ip+"|"+userAgent)
+	if err != nil {
+		utils.WriteQueueError(c, err)
+		return nil, false
+	}
+	if ticket != nil {
+		c.Header("X-Queue-Wait-Seconds", fmt.Sprintf("%.0f", ticket.WaitedSeconds()))
+	}
+	return ticket, true
+}
+
 // handleBlobRequest 处理blob请求
 func handleBlobRequest(c *gin.Context, imageRef, digest string) {
+	// 先校验引用合法性，避免无效请求占用下载名额
 	digestRef, err := name.NewDigest(fmt.Sprintf("%s@%s", imageRef, digest))
 	if err != nil {
 		fmt.Printf("解析digest引用失败: %v\n", err)
 		c.String(http.StatusBadRequest, "Invalid digest reference")
 		return
 	}
+
+	ticket, ok := acquireDownloadSlot(c, shortDigestLabel(digest))
+	if !ok {
+		return
+	}
+	defer utils.ReleaseDownload(ticket)
 
 	layer, err := remote.Layer(digestRef, dockerProxy.options...)
 	if err != nil {
@@ -569,6 +603,12 @@ func handleUpstreamBlobRequest(c *gin.Context, imageRef, digest string, mapping 
 		c.String(http.StatusBadRequest, "Invalid digest reference")
 		return
 	}
+
+	ticket, ok := acquireDownloadSlot(c, shortDigestLabel(digest))
+	if !ok {
+		return
+	}
+	defer utils.ReleaseDownload(ticket)
 
 	options := createUpstreamOptions(mapping)
 	layer, err := remote.Layer(digestRef, options...)

@@ -1,4 +1,4 @@
-﻿---
+---
 title: 离线镜像包
 description: 在线打包 Docker 镜像为 tar 文件，支持单镜像与批量下载。
 ---
@@ -92,6 +92,8 @@ curl "https://example.com/api/image/info?image=library/nginx:latest"
 | 配置 / 规则 | 默认值 | 说明 |
 |------------|--------|------|
 | `[download].maxImages` | `10` | 单次批量镜像数量上限 |
+| `[download].maxConcurrent` | `4` | 全局同时下载任务上限，超出自动排队，可在页面看到排队位置和预计等待时间 |
+| `[download].maxQueueSize` | `100` | 排队队列长度上限，满后返回 503 |
 | prepare 防抖（单镜像） | 5 秒 | 同一用户重复 prepare 会返回 429 |
 | prepare 防抖（批量） | 60 秒 | 同上 |
 | Token TTL | 2 分钟 | 过期或 IP/UA 不匹配则无效 |
@@ -99,6 +101,9 @@ curl "https://example.com/api/image/info?image=library/nginx:latest"
 ```toml
 [download]
 maxImages = 10
+maxConcurrent = 4
+maxQueueSize = 100
+queueTimeout = "10m"
 ```
 
 ## 注意事项

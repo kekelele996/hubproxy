@@ -1,4 +1,4 @@
-﻿---
+---
 title: Environment Variables
 description: Environment variables supported by HubProxy.
 ---
@@ -21,6 +21,9 @@ Environment variables override config after `config.toml` is loaded. Sections no
 | `IP_BLACKLIST` | `[security].blackList` | Append blocked IPs, comma-separated |
 | `ACCESS_PROXY` | `[access].proxy` | Upstream SOCKS5 proxy URL |
 | `MAX_IMAGES` | `[download].maxImages` | Max images per batch offline download |
+| `MAX_CONCURRENT_DOWNLOADS` | `[download].maxConcurrent` | Max simultaneous downloads; extra requests wait in queue. `0` disables the limit |
+| `MAX_DOWNLOAD_QUEUE_SIZE` | `[download].maxQueueSize` | Max download queue length; new requests get 503 when full |
+| `DOWNLOAD_QUEUE_TIMEOUT` | `[download].queueTimeout` | Max wait time in the download queue (e.g. `10m`) |
 
 ## Examples
 

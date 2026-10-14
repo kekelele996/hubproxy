@@ -39,8 +39,39 @@ async function getJSON<T>(url: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T
 }
 
+export interface QueueInfo {
+  enabled: boolean
+  active?: number
+  waiting?: number
+  max_concurrent?: number
+  max_queue_size?: number
+  completed?: number
+  avg_download_seconds?: number
+  estimated_wait_seconds?: number
+}
+
+export interface TicketStatus {
+  id: string
+  state: 'waiting' | 'active' | 'done'
+  label: string
+  position: number
+  wait_seconds: number
+  estimated_wait_seconds?: number
+}
+
+export interface QueueStatusResponse extends QueueInfo {
+  ticket?: TicketStatus
+}
+
 export interface PrepareDownloadResponse {
   download_url: string
+  ticket_id?: string
+  queue?: QueueInfo
+}
+
+export function fetchQueueStatus(ticket?: string) {
+  const query = ticket ? `?ticket=${encodeURIComponent(ticket)}` : ''
+  return getJSON<QueueStatusResponse>(`/api/queue/status${query}`)
 }
 
 export interface ImageInfoResponse {

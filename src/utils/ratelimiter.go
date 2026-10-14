@@ -225,8 +225,10 @@ func (i *IPRateLimiter) GetLimiter(ip string) (*rate.Limiter, bool) {
 func RateLimitMiddleware(limiter *IPRateLimiter) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		path := c.Request.URL.Path
+		// /api/queue/status 是排队方轮询位置和预计时间用的只读接口，
+		// 频繁轮询不应计入每IP请求数限制
 		if path == "/" || path == "/images" || path == "/search" ||
-			path == "/favicon.ico" ||
+			path == "/favicon.ico" || path == "/api/queue/status" ||
 			strings.HasPrefix(path, "/assets/") {
 			c.Next()
 			return

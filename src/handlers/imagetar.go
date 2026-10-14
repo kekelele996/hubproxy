@@ -142,12 +142,14 @@ type BatchDownloadRequest struct {
 	Images              []string
 	Platform            string
 	UseCompressedLayers bool
+	Ticket              string
 }
 
 type SingleDownloadRequest struct {
 	Image               string
 	Platform            string
 	UseCompressedLayers bool
+	Ticket              string
 }
 
 type tokenEntry[T any] struct {
@@ -721,6 +723,48 @@ func resolveImageRef(c *gin.Context) string {
 	return strings.TrimSpace(c.Query("image"))
 }
 
+// joinDownloadTicket prepare 阶段提前进入下载队列取票，返回票据ID。
+// ok=false 表示已向客户端写入排队错误响应。
+func joinDownloadTicket(c *gin.Context, label string) (string, bool) {
+	if !utils.QueueEnabled() {
+		return "", true
+	}
+	ip, userAgent := getClientIdentity(c)
+	ticket, err := utils.JoinDownload(label, ip+"|"+userAgent)
+	if err != nil {
+		utils.WriteQueueError(c, err)
+		return "", false
+	}
+	if ticket == nil {
+		return "", true
+	}
+	return ticket.ID, true
+}
+
+// awaitDownloadTicket 下载请求到达后等待排队名额，返回后调用方需 defer Release。
+func awaitDownloadTicket(c *gin.Context, ticketID string) (*utils.Ticket, bool) {
+	if !utils.QueueEnabled() || ticketID == "" {
+		return nil, true
+	}
+	ip, userAgent := getClientIdentity(c)
+	ticket, err := utils.AwaitDownload(c.Request.Context(), ticketID, ip+"|"+userAgent)
+	if err != nil {
+		utils.WriteQueueError(c, err)
+		return nil, false
+	}
+	return ticket, true
+}
+
+// queuePrepareResponse prepare 响应附带票据ID和当前队列快照，供前端轮询排队进度
+func queuePrepareResponse(downloadURL, ticketID string) gin.H {
+	resp := gin.H{"download_url": downloadURL}
+	if ticketID != "" {
+		resp["ticket_id"] = ticketID
+		resp["queue"] = utils.GlobalQueueStats()
+	}
+	return resp
+}
+
 // handleDirectImageDownload 处理单镜像下载
 func handleDirectImageDownload(c *gin.Context) {
 	imageRef := resolveImageRef(c)
@@ -761,10 +805,15 @@ func handleDirectImageDownload(c *gin.Context) {
 		}
 
 		ip, userAgent := getClientIdentity(c)
+		ticketID, ok := joinDownloadTicket(c, "image:"+imageRef)
+		if !ok {
+			return
+		}
 		token, err := singleDownloadTokens.create(SingleDownloadRequest{
 			Image:               imageRef,
 			Platform:            platform,
 			UseCompressedLayers: useCompressed,
+			Ticket:              ticketID,
 		}, ip, userAgent)
 		if err != nil {
 			c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
@@ -774,7 +823,7 @@ func handleDirectImageDownload(c *gin.Context) {
 		q := url.Values{}
 		q.Set("image", imageRef)
 		q.Set("token", token)
-		c.JSON(http.StatusOK, gin.H{"download_url": "/api/image/download?" + q.Encode()})
+		c.JSON(http.StatusOK, queuePrepareResponse("/api/image/download?"+q.Encode(), ticketID))
 		return
 	}
 
@@ -798,6 +847,12 @@ func handleDirectImageDownload(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": reason})
 		return
 	}
+
+	ticket, ok := awaitDownloadTicket(c, req.Ticket)
+	if !ok {
+		return
+	}
+	defer utils.ReleaseDownload(ticket)
 
 	options := &StreamOptions{
 		Platform:            req.Platform,
@@ -834,6 +889,12 @@ func handleSimpleBatchDownload(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "镜像列表不能为空"})
 			return
 		}
+
+		ticket, ok := awaitDownloadTicket(c, req.Ticket)
+		if !ok {
+			return
+		}
+		defer utils.ReleaseDownload(ticket)
 
 		options := &StreamOptions{
 			Platform:            req.Platform,
@@ -917,19 +978,25 @@ func handleSimpleBatchDownload(c *gin.Context) {
 		useCompressed = *req.UseCompressedLayers
 	}
 
+	ip, userAgent := getClientIdentity(c)
+	ticketID, ok := joinDownloadTicket(c, fmt.Sprintf("batch:%d images", len(req.Images)))
+	if !ok {
+		return
+	}
+
 	batchReq := BatchDownloadRequest{
 		Images:              req.Images,
 		Platform:            req.Platform,
 		UseCompressedLayers: useCompressed,
+		Ticket:              ticketID,
 	}
 
-	ip, userAgent := getClientIdentity(c)
 	token, err := batchDownloadTokens.create(batchReq, ip, userAgent)
 	if err != nil {
 		c.JSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"download_url": fmt.Sprintf("/api/image/batch?token=%s", token)})
+	c.JSON(http.StatusOK, queuePrepareResponse(fmt.Sprintf("/api/image/batch?token=%s", token), ticketID))
 }
 
 // handleImageInfo 处理镜像信息查询

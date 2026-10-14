@@ -1,4 +1,4 @@
-﻿---
+---
 title: Offline Images
 description: Package Docker images as tar files online, with single and batch download.
 ---
@@ -92,6 +92,8 @@ curl "https://example.com/api/image/info?image=library/nginx:latest"
 | Config / Rule | Default | Description |
 |--------------|---------|-------------|
 | `[download].maxImages` | `10` | Max images per batch |
+| `[download].maxConcurrent` | `4` | Global max simultaneous downloads; extra requests queue automatically, with position and ETA shown on the page |
+| `[download].maxQueueSize` | `100` | Max queue length; returns 503 when full |
 | Prepare debounce (single) | 5s | Repeated prepare returns 429 |
 | Prepare debounce (batch) | 60s | Same for batch |
 | Token TTL | 2 min | Invalid if expired or IP/UA mismatch |
@@ -99,6 +101,9 @@ curl "https://example.com/api/image/info?image=library/nginx:latest"
 ```toml
 [download]
 maxImages = 10
+maxConcurrent = 4
+maxQueueSize = 100
+queueTimeout = "10m"
 ```
 
 ## Notes

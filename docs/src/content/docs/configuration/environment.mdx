@@ -1,4 +1,4 @@
-﻿---
+---
 title: 环境变量
 description: HubProxy 支持的环境变量说明。
 ---
@@ -21,6 +21,9 @@ description: HubProxy 支持的环境变量说明。
 | `IP_BLACKLIST` | `[security].blackList` | 追加封禁 IP，逗号分隔 |
 | `ACCESS_PROXY` | `[access].proxy` | 上游 SOCKS5 代理地址 |
 | `MAX_IMAGES` | `[download].maxImages` | 批量离线镜像数量上限 |
+| `MAX_CONCURRENT_DOWNLOADS` | `[download].maxConcurrent` | 同时进行的下载任务数上限，超出排队等待；`0` 表示不限制 |
+| `MAX_DOWNLOAD_QUEUE_SIZE` | `[download].maxQueueSize` | 下载排队队列最大长度，满后新请求返回 503 |
+| `DOWNLOAD_QUEUE_TIMEOUT` | `[download].queueTimeout` | 单个下载最长排队等待时间（如 `10m`） |
 
 ## 示例
 

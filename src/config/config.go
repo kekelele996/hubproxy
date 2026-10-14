@@ -46,7 +46,14 @@ type AppConfig struct {
 	} `toml:"access"`
 
 	Download struct {
+		// MaxImages 批量下载离线镜像数量上限
 		MaxImages int `toml:"maxImages"`
+		// MaxConcurrent 同时进行的下载任务数上限，超出后排队等待；<=0 表示不限制
+		MaxConcurrent int `toml:"maxConcurrent"`
+		// MaxQueueSize 排队队列最大长度，队列满后新请求直接失败并提示稍后重试
+		MaxQueueSize int `toml:"maxQueueSize"`
+		// QueueTimeout 单次排队最长等待时间（如 "10m"）
+		QueueTimeout string `toml:"queueTimeout"`
 	} `toml:"download"`
 
 	Registries map[string]RegistryMapping `toml:"registries"`
@@ -107,9 +114,15 @@ func DefaultConfig() *AppConfig {
 			Proxy:     "",
 		},
 		Download: struct {
-			MaxImages int `toml:"maxImages"`
+			MaxImages     int    `toml:"maxImages"`
+			MaxConcurrent int    `toml:"maxConcurrent"`
+			MaxQueueSize  int    `toml:"maxQueueSize"`
+			QueueTimeout  string `toml:"queueTimeout"`
 		}{
-			MaxImages: 10,
+			MaxImages:     10,
+			MaxConcurrent: 4,
+			MaxQueueSize:  100,
+			QueueTimeout:  "10m",
 		},
 		Registries: map[string]RegistryMapping{
 			"ghcr.io": {
@@ -274,5 +287,20 @@ func overrideFromEnv(cfg *AppConfig) {
 		if maxImages, err := strconv.Atoi(val); err == nil && maxImages > 0 {
 			cfg.Download.MaxImages = maxImages
 		}
+	}
+
+	// 0 表示关闭并发限制，因此这里允许 0，仅排除负数和非法值
+	if val := os.Getenv("MAX_CONCURRENT_DOWNLOADS"); val != "" {
+		if maxConcurrent, err := strconv.Atoi(val); err == nil && maxConcurrent >= 0 {
+			cfg.Download.MaxConcurrent = maxConcurrent
+		}
+	}
+	if val := os.Getenv("MAX_DOWNLOAD_QUEUE_SIZE"); val != "" {
+		if maxQueueSize, err := strconv.Atoi(val); err == nil && maxQueueSize > 0 {
+			cfg.Download.MaxQueueSize = maxQueueSize
+		}
+	}
+	if val := strings.TrimSpace(os.Getenv("DOWNLOAD_QUEUE_TIMEOUT")); val != "" {
+		cfg.Download.QueueTimeout = val
 	}
 }

@@ -1,4 +1,4 @@
-﻿---
+---
 title: config.toml 参考
 description: HubProxy 配置文件完整参考。
 ---
@@ -54,6 +54,13 @@ Docker 拉取一个镜像会请求多个 layer，每个 HTTP 请求均消耗限�
 | 键 | 类型 | 默认值 | 说明 |
 |----|------|--------|------|
 | `maxImages` | int | `10` | 批量离线镜像数量上限 |
+| `maxConcurrent` | int | `4` | 同时进行的下载任务数上限（镜像层、GitHub/HF 大文件、离线镜像包共用额度），超出后按先后顺序排队等待；`0` 表示不限制 |
+| `maxQueueSize` | int | `100` | 排队队列最大长度，队列满后新请求返回 `503` 和 `Retry-After` |
+| `queueTimeout` | duration | `10m` | 单个下载在队列中的最长等待时间，超时返回 `503` 让客户端重试 |
+
+### 下载排队
+
+下载人数较多时，服务端只放行 `maxConcurrent` 个下载任务，其余请求在服务端排队（FIFO），不会全部挤入上游抢带宽；客户端断开或等待超时会自动让出位置。排队位置和预计等待时间可通过 `GET /api/queue/status`（支持 `?ticket=<id>` 查询个人票据）获取，Web 界面下载离线镜像时会自动展示排队进度。
 
 ## [registries]
 

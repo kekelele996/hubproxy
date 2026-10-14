@@ -103,6 +103,7 @@ func buildRouter(cfg *config.AppConfig) *gin.Engine {
 	router.Use(utils.RateLimitMiddleware(globalLimiter))
 
 	initHealthRoutes(router)
+	router.GET("/api/queue/status", utils.QueueStatusHandler)
 	handlers.InitImageTarRoutes(router)
 	registerFrontendRoutes(router, cfg.Server.EnableFrontend)
 	handlers.RegisterSearchRoute(router)
@@ -123,6 +124,7 @@ func main() {
 
 	utils.InitHTTPClients()
 	globalLimiter = utils.InitGlobalLimiter()
+	utils.InitGlobalDownloadQueue()
 	handlers.InitDockerProxy()
 	handlers.InitImageStreamer()
 	handlers.InitDebouncer()
@@ -133,6 +135,11 @@ func main() {
 	fmt.Printf("HubProxy 启动成功\n")
 	fmt.Printf("监听地址: %s:%d\n", cfg.Server.Host, cfg.Server.Port)
 	fmt.Printf("限流配置: %d请求/%g小时\n", cfg.RateLimit.RequestLimit, cfg.RateLimit.PeriodHours)
+	if cfg.Download.MaxConcurrent > 0 {
+		fmt.Printf("下载并发: 最多同时%d个下载，排队上限%d\n", cfg.Download.MaxConcurrent, cfg.Download.MaxQueueSize)
+	} else {
+		fmt.Printf("下载并发: 未启用限制\n")
+	}
 	if cfg.Server.EnableH2C {
 		fmt.Printf("H2c: 已启用\n")
 	}

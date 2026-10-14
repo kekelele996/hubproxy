@@ -25,6 +25,34 @@ func TestCheckGitHubURL(t *testing.T) {
 	}
 }
 
+func TestIsHeavyDownloadURL(t *testing.T) {
+	heavy := []string{
+		"https://github.com/user/repo/releases/download/v1/file.tar.gz",
+		"https://github.com/user/repo/archive/refs/tags/v1.tar.gz",
+		"https://huggingface.co/user/model/resolve/main/model.bin",
+		"https://huggingface.co/spaces/user/app/resolve/main/data.parquet",
+		"https://cdn-lfs.hf.co/user/repo/abcdef?response-content-disposition=attachment",
+	}
+	for _, u := range heavy {
+		if !isHeavyDownloadURL(u) {
+			t.Fatalf("期望判定为大文件下载: %s", u)
+		}
+	}
+
+	light := []string{
+		"https://raw.githubusercontent.com/user/repo/main/install.sh",
+		"https://github.com/user/repo/blob/main/README.md",
+		"https://api.github.com/repos/user/repo/releases/latest",
+		"https://github.com/user/repo/info/refs?service=git-upload-pack",
+		"https://huggingface.co/api/models/user/model",
+	}
+	for _, u := range light {
+		if isHeavyDownloadURL(u) {
+			t.Fatalf("不应判定为大文件下载: %s", u)
+		}
+	}
+}
+
 func TestCheckGitHubURLRejectsOtherHosts(t *testing.T) {
 	if got := CheckGitHubURL("https://example.com/user/repo/file"); got != nil {
 		t.Fatalf("unexpected match: %#v", got)

@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onUnmounted, ref } from 'vue'
 import { Loader2 } from 'lucide-vue-next'
 import {
   fetchImageInfo,
+  fetchQueueStatus,
   prepareBatchDownload,
   prepareSingleDownload,
   triggerDownload,
+  type TicketStatus,
 } from '@/api'
 import { errorMessage } from '@/lib/utils'
 import Button from '@/components/ui/Button.vue'
@@ -28,6 +30,53 @@ const batchStatus = ref('')
 const batchError = ref('')
 const batchLoading = ref(false)
 
+// 排队状态轮询句柄，离开页面时停止
+let stopSinglePoll: (() => void) | undefined
+let stopBatchPoll: (() => void) | undefined
+onUnmounted(() => {
+  stopSinglePoll?.()
+  stopBatchPoll?.()
+})
+
+function formatEta(seconds?: number): string {
+  if (!seconds || seconds <= 0) return ''
+  if (seconds < 60) return `预计还需约 ${seconds} 秒`
+  return `预计还需约 ${Math.max(1, Math.round(seconds / 60))} 分钟`
+}
+
+// 轮询排队票据：等待中刷新位置和预计时间，开始下载后回调并停止
+function pollQueueTicket(
+  ticketId: string,
+  onWaiting: (ticket: TicketStatus) => void,
+  onStarted: () => void,
+): () => void {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let stopped = false
+
+  const tick = async () => {
+    if (stopped) return
+    try {
+      const data = await fetchQueueStatus(ticketId)
+      if (stopped || !data.ticket) return
+      if (data.ticket.state === 'waiting') {
+        onWaiting(data.ticket)
+        timer = setTimeout(tick, 2000)
+      } else {
+        onStarted()
+      }
+    } catch {
+      // 票据过期或下载已结束时接口返回404，停止轮询即可
+      onStarted()
+    }
+  }
+
+  timer = setTimeout(tick, 1000)
+  return () => {
+    stopped = true
+    if (timer) clearTimeout(timer)
+  }
+}
+
 async function preflight(images: string[]) {
   for (const image of [...new Set(images)]) {
     await fetchImageInfo(image)
@@ -37,6 +86,7 @@ async function preflight(images: string[]) {
 async function onSingleSubmit() {
   singleError.value = ''
   singleStatus.value = ''
+  stopSinglePoll?.()
   const image = singleImage.value.trim()
   if (!image) {
     singleError.value = '请输入镜像名称'
@@ -45,6 +95,7 @@ async function onSingleSubmit() {
 
   singleLoading.value = true
   singleStatus.value = '正在准备下载...'
+  let waitingInQueue = false
   try {
     await preflight([image])
     const data = await prepareSingleDownload({
@@ -57,18 +108,37 @@ async function onSingleSubmit() {
     const platformText = singlePlatform.value.trim()
       ? ` (${singlePlatform.value.trim()})`
       : ''
-    singleStatus.value = `开始下载 ${image}${platformText}`
+
+    if (data.ticket_id) {
+      // 下载请求已在浏览器中发出，服务端按队列放行，这里同步展示排队进度
+      waitingInQueue = true
+      singleStatus.value = '下载排队中，等待下载名额...'
+      stopSinglePoll = pollQueueTicket(
+        data.ticket_id,
+        (ticket) => {
+          const eta = formatEta(ticket.estimated_wait_seconds)
+          singleStatus.value = `下载排队中：前面还有 ${ticket.position + 1} 个任务${eta ? '，' + eta : ''}`
+        },
+        () => {
+          singleLoading.value = false
+          singleStatus.value = `已开始下载 ${image}${platformText}，请在浏览器下载任务中查看`
+        },
+      )
+    } else {
+      singleStatus.value = `开始下载 ${image}${platformText}`
+    }
   } catch (e) {
     singleStatus.value = ''
     singleError.value = errorMessage(e, '下载失败')
   } finally {
-    singleLoading.value = false
+    if (!waitingInQueue) singleLoading.value = false
   }
 }
 
 async function onBatchSubmit() {
   batchError.value = ''
   batchStatus.value = ''
+  stopBatchPoll?.()
   const images = batchText.value
     .split('\n')
     .map((line) => line.trim())
@@ -81,6 +151,7 @@ async function onBatchSubmit() {
 
   batchLoading.value = true
   batchStatus.value = '正在准备批量下载...'
+  let waitingInQueue = false
   try {
     await preflight(images)
     const data = await prepareBatchDownload({
@@ -90,12 +161,29 @@ async function onBatchSubmit() {
     })
     if (!data.download_url) throw new Error('下载地址生成失败')
     triggerDownload(data.download_url)
-    batchStatus.value = `开始下载 ${images.length} 个镜像`
+
+    if (data.ticket_id) {
+      waitingInQueue = true
+      batchStatus.value = '下载排队中，等待下载名额...'
+      stopBatchPoll = pollQueueTicket(
+        data.ticket_id,
+        (ticket) => {
+          const eta = formatEta(ticket.estimated_wait_seconds)
+          batchStatus.value = `下载排队中：前面还有 ${ticket.position + 1} 个任务${eta ? '，' + eta : ''}`
+        },
+        () => {
+          batchLoading.value = false
+          batchStatus.value = `已开始下载 ${images.length} 个镜像，请在浏览器下载任务中查看`
+        },
+      )
+    } else {
+      batchStatus.value = `开始下载 ${images.length} 个镜像`
+    }
   } catch (e) {
     batchStatus.value = ''
     batchError.value = errorMessage(e, '下载失败')
   } finally {
-    batchLoading.value = false
+    if (!waitingInQueue) batchLoading.value = false
   }
 }
 </script>

@@ -1,4 +1,4 @@
-﻿---
+---
 title: config.toml Reference
 description: Complete reference for the HubProxy configuration file.
 ---
@@ -54,6 +54,13 @@ Wildcards supported: `owner/*`, `*/repo-name`.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `maxImages` | int | `10` | Max images per batch offline download |
+| `maxConcurrent` | int | `4` | Max simultaneous downloads (shared by image blobs, GitHub/HF large files and offline image tarballs); extra requests wait in FIFO queue. `0` disables the limit |
+| `maxQueueSize` | int | `100` | Max queue length; new requests receive `503` with `Retry-After` when full |
+| `queueTimeout` | duration | `10m` | Max time a download may wait in queue; on timeout the server returns `503` so clients can retry |
+
+### Download queue
+
+When many users download at once, only `maxConcurrent` downloads are active and the rest wait server-side in FIFO order instead of competing for upstream bandwidth. Disconnecting clients or timed-out waiters release their slot automatically. Queue position and estimated wait time are available at `GET /api/queue/status` (use `?ticket=<id>` for a personal ticket); the web UI shows queuing progress automatically for offline image downloads.
 
 ## [registries]
 
