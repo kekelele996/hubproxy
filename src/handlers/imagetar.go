@@ -14,6 +14,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -317,6 +318,23 @@ func setDownloadHeaders(c *gin.Context, filename string, compressed bool) {
 	if compressed {
 		c.Header("Content-Encoding", "gzip")
 	}
+}
+
+// lazyHeaderWriter 在首次写入响应体时才设置下载响应头，
+// 使得批量打包在首个镜像成功前仍可切换为 JSON 错误响应。
+type lazyHeaderWriter struct {
+	c          *gin.Context
+	filename   string
+	compressed bool
+	written    bool
+}
+
+func (w *lazyHeaderWriter) Write(p []byte) (int, error) {
+	if !w.written && len(p) > 0 {
+		w.written = true
+		setDownloadHeaders(w.c, w.filename, w.compressed)
+	}
+	return w.c.Writer.Write(p)
 }
 
 // writeDownloadError 仅在尚未写出响应体时返回 JSON；流已开始则只记日志，避免损坏 tar。
@@ -845,11 +863,28 @@ func handleSimpleBatchDownload(c *gin.Context) {
 		log.Printf("批量下载 %d 个镜像 (平台: %s)", len(req.Images), formatPlatformText(req.Platform))
 
 		filename := fmt.Sprintf("batch_%d_images.tar", len(req.Images))
-		setDownloadHeaders(c, filename, options.Compression)
+		// 响应头延迟到首个镜像成功后再发送：若全部失败，仍可返回 JSON 报告
+		lazyWriter := &lazyHeaderWriter{
+			c:          c,
+			filename:   filename,
+			compressed: options.Compression,
+		}
 
-		if err := globalImageStreamer.StreamMultipleImages(ctx, req.Images, c.Writer, options); err != nil {
+		report, err := globalImageStreamer.StreamMultipleImages(ctx, req.Images, lazyWriter, options)
+		if err != nil {
 			writeDownloadError(c, err, "批量镜像下载失败")
 			return
+		}
+		if !lazyWriter.written {
+			c.JSON(http.StatusBadGateway, gin.H{
+				"error":  "所有镜像均打包失败",
+				"report": report,
+			})
+			return
+		}
+		if report.FailureCount > 0 {
+			log.Printf("批量下载部分失败: 成功 %d，失败 %d，明细见包内 download-report.txt",
+				report.SuccessCount, report.FailureCount)
 		}
 		return
 	}
@@ -994,49 +1029,86 @@ func handleImageInfo(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": info})
 }
 
-// StreamMultipleImages 批量下载多个镜像
-func (is *ImageStreamer) StreamMultipleImages(ctx context.Context, imageRefs []string, writer io.Writer, options *StreamOptions) error {
+// BatchImageFailure 批量下载中失败的镜像及原因
+type BatchImageFailure struct {
+	Image string `json:"image"`
+	Error string `json:"error"`
+}
+
+// BatchReport 批量下载结果报告
+type BatchReport struct {
+	Platform     string              `json:"platform,omitempty"`
+	Total        int                 `json:"total"`
+	SuccessCount int                 `json:"success_count"`
+	FailureCount int                 `json:"failure_count"`
+	Succeeded    []string            `json:"succeeded"`
+	Failed       []BatchImageFailure `json:"failed"`
+	GeneratedAt  time.Time           `json:"generated_at"`
+}
+
+// batchImageTimeout 单个镜像打包超时时间
+const batchImageTimeout = 15 * time.Minute
+
+// imageStager 将单个镜像的 docker-save 条目写入独立 tar，便于失败隔离
+type imageStager func(ctx context.Context, tarWriter *tar.Writer, imageRef string, options *StreamOptions) (map[string]interface{}, map[string]map[string]string, error)
+
+// StreamMultipleImages 批量下载多个镜像。
+// 单个镜像失败不会中断整个批次：每个镜像先暂存到独立临时 tar，
+// 成功后才拼接到输出流，失败则跳过并记录；包内附带下载报告。
+// 若全部失败，不会向 writer 写入任何数据，由调用方返回 JSON 错误。
+func (is *ImageStreamer) StreamMultipleImages(ctx context.Context, imageRefs []string, writer io.Writer, options *StreamOptions) (*BatchReport, error) {
+	return is.streamMultipleImagesWithStager(ctx, imageRefs, writer, options, is.streamSingleImageForBatch)
+}
+
+func (is *ImageStreamer) streamMultipleImagesWithStager(ctx context.Context, imageRefs []string, writer io.Writer, options *StreamOptions, stage imageStager) (report *BatchReport, err error) {
 	if options == nil {
 		options = &StreamOptions{UseCompressedLayers: true}
 	}
 
-	var finalWriter io.Writer = writer
-	if options.Compression {
-		gzWriter := gzip.NewWriter(writer)
-		defer gzWriter.Close()
-		finalWriter = gzWriter
+	report = &BatchReport{
+		Platform:    options.Platform,
+		Total:       len(imageRefs),
+		Succeeded:   []string{},
+		Failed:      []BatchImageFailure{},
+		GeneratedAt: time.Now(),
 	}
 
-	tarWriter := tar.NewWriter(finalWriter)
-	defer tarWriter.Close()
+	finalWriter := writer
+	var gzWriter *lazyGzipWriter
+	if options.Compression {
+		gzWriter = &lazyGzipWriter{parent: writer}
+		finalWriter = gzWriter
+		defer func() {
+			if closeErr := gzWriter.Close(); closeErr != nil && err == nil {
+				err = closeErr
+			}
+		}()
+	}
 
-	var allManifests []map[string]interface{}
-	var allRepositories = make(map[string]map[string]string)
+	allManifests := []map[string]interface{}{}
+	allRepositories := make(map[string]map[string]string)
 
 	for i, imageRef := range imageRefs {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return report, ctx.Err()
 		default:
 		}
 
 		log.Printf("处理镜像 %d/%d: %s", i+1, len(imageRefs), imageRef)
 
-		timeoutCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
-		manifest, repositories, err := is.streamSingleImageForBatch(timeoutCtx, tarWriter, imageRef, options)
-		cancel()
-
-		if err != nil {
-			log.Printf("下载镜像 %s 失败: %v", imageRef, err)
-			return fmt.Errorf("下载镜像 %s 失败: %w", imageRef, err)
+		manifest, repositories, stageErr := is.stageOneImage(ctx, imageRef, options, finalWriter, stage)
+		if stageErr != nil {
+			log.Printf("镜像 %s 打包失败，已跳过: %v", imageRef, stageErr)
+			report.Failed = append(report.Failed, BatchImageFailure{
+				Image: imageRef,
+				Error: stageErr.Error(),
+			})
+			continue
 		}
 
-		if manifest == nil {
-			return fmt.Errorf("镜像 %s manifest数据为空", imageRef)
-		}
-
+		report.Succeeded = append(report.Succeeded, imageRef)
 		allManifests = append(allManifests, manifest)
-
 		for repo, tags := range repositories {
 			if allRepositories[repo] == nil {
 				allRepositories[repo] = make(map[string]string)
@@ -1047,44 +1119,158 @@ func (is *ImageStreamer) StreamMultipleImages(ctx context.Context, imageRefs []s
 		}
 	}
 
-	manifestData, err := json.Marshal(allManifests)
+	report.SuccessCount = len(report.Succeeded)
+	report.FailureCount = len(report.Failed)
+
+	// 全部失败时不写出 tar，由调用方向客户端返回 JSON 报告
+	if report.SuccessCount == 0 {
+		return report, nil
+	}
+
+	tarWriter := tar.NewWriter(finalWriter)
+
+	if err := writeTarJSON(tarWriter, "manifest.json", allManifests); err != nil {
+		return report, fmt.Errorf("写入manifest失败: %w", err)
+	}
+	if err := writeTarJSON(tarWriter, "repositories", allRepositories); err != nil {
+		return report, fmt.Errorf("写入repositories失败: %w", err)
+	}
+	if err := writeTarJSON(tarWriter, "download-report.json", report); err != nil {
+		return report, fmt.Errorf("写入下载报告失败: %w", err)
+	}
+	if err := writeTarText(tarWriter, "download-report.txt", renderBatchReportText(report)); err != nil {
+		return report, fmt.Errorf("写入下载报告失败: %w", err)
+	}
+
+	if err := tarWriter.Close(); err != nil {
+		return report, fmt.Errorf("关闭tar失败: %w", err)
+	}
+
+	log.Printf("批量下载完成: 共 %d 个，成功 %d 个，失败 %d 个",
+		report.Total, report.SuccessCount, report.FailureCount)
+	return report, nil
+}
+
+// lazyGzipWriter 延迟初始化 gzip：首次写入时才写 gzip 头尾，
+// 保证全部镜像失败、无任何字节产出时不会污染下游输出。
+type lazyGzipWriter struct {
+	parent io.Writer
+	gz     *gzip.Writer
+}
+
+func (w *lazyGzipWriter) Write(p []byte) (int, error) {
+	if w.gz == nil && len(p) > 0 {
+		w.gz = gzip.NewWriter(w.parent)
+	}
+	if w.gz == nil {
+		return len(p), nil
+	}
+	return w.gz.Write(p)
+}
+
+func (w *lazyGzipWriter) Close() error {
+	if w.gz == nil {
+		return nil
+	}
+	return w.gz.Close()
+}
+
+// stageOneImage 将单个镜像暂存到临时文件，成功后把完整 tar 条目拼接到输出流。
+// 拼接的是暂存 tar 中除结尾零块外的原始条目，多个镜像条目首尾相接仍为合法 tar。
+func (is *ImageStreamer) stageOneImage(ctx context.Context, imageRef string, options *StreamOptions, output io.Writer, stage imageStager) (map[string]interface{}, map[string]map[string]string, error) {
+	tmp, err := os.CreateTemp("", "hubproxy-batch-*.tar")
 	if err != nil {
-		return fmt.Errorf("序列化manifest失败: %w", err)
+		return nil, nil, fmt.Errorf("创建临时文件失败: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	defer tmp.Close()
+
+	stageWriter := tar.NewWriter(tmp)
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, batchImageTimeout)
+	manifest, repositories, stageErr := stage(timeoutCtx, stageWriter, imageRef, options)
+	cancel()
+
+	if stageErr != nil {
+		_ = stageWriter.Close()
+		return nil, nil, stageErr
+	}
+	if manifest == nil {
+		_ = stageWriter.Close()
+		return nil, nil, fmt.Errorf("manifest数据为空")
 	}
 
-	manifestHeader := &tar.Header{
-		Name: "manifest.json",
-		Size: int64(len(manifestData)),
-		Mode: 0644,
+	// Flush 先把最后一个条目的填充块落盘，此时文件长度恰好是全部条目字节数；
+	// 随后的 Close 只会追加 1024 字节的 tar 结尾零块，拼接时需排除。
+	flushErr := stageWriter.Flush()
+	entrySize, seekErr := tmp.Seek(0, io.SeekCurrent)
+	closeErr := stageWriter.Close()
+
+	if flushErr != nil {
+		return nil, nil, fmt.Errorf("刷新临时tar失败: %w", flushErr)
+	}
+	if seekErr != nil {
+		return nil, nil, fmt.Errorf("记录临时文件大小失败: %w", seekErr)
+	}
+	if closeErr != nil {
+		return nil, nil, fmt.Errorf("关闭临时tar失败: %w", closeErr)
 	}
 
-	if err := tarWriter.WriteHeader(manifestHeader); err != nil {
-		return fmt.Errorf("写入manifest header失败: %w", err)
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return nil, nil, fmt.Errorf("回读临时文件失败: %w", err)
+	}
+	if _, err := io.CopyN(output, tmp, entrySize); err != nil {
+		return nil, nil, fmt.Errorf("写入输出流失败: %w", err)
 	}
 
-	if _, err := tarWriter.Write(manifestData); err != nil {
-		return fmt.Errorf("写入manifest数据失败: %w", err)
-	}
+	return manifest, repositories, nil
+}
 
-	repositoriesData, err := json.Marshal(allRepositories)
+// writeTarJSON 向 tar 写入一个 JSON 文件条目
+func writeTarJSON(tarWriter *tar.Writer, name string, value interface{}) error {
+	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
-		return fmt.Errorf("序列化repositories失败: %w", err)
+		return err
 	}
+	return writeTarText(tarWriter, name, string(data))
+}
 
-	repositoriesHeader := &tar.Header{
-		Name: "repositories",
-		Size: int64(len(repositoriesData)),
+// writeTarText 向 tar 写入一个文本文件条目
+func writeTarText(tarWriter *tar.Writer, name, content string) error {
+	if err := tarWriter.WriteHeader(&tar.Header{
+		Name: name,
+		Size: int64(len(content)),
 		Mode: 0644,
+	}); err != nil {
+		return err
 	}
+	_, err := io.WriteString(tarWriter, content)
+	return err
+}
 
-	if err := tarWriter.WriteHeader(repositoriesHeader); err != nil {
-		return fmt.Errorf("写入repositories header失败: %w", err)
+// renderBatchReportText 生成人类可读的批量下载报告
+func renderBatchReportText(report *BatchReport) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "HubProxy 批量下载报告\n")
+	fmt.Fprintf(&b, "生成时间: %s\n", report.GeneratedAt.Format("2006-01-02 15:04:05"))
+	if report.Platform != "" {
+		fmt.Fprintf(&b, "目标平台: %s\n", report.Platform)
 	}
+	fmt.Fprintf(&b, "总数: %d，成功: %d，失败: %d\n", report.Total, report.SuccessCount, report.FailureCount)
 
-	if _, err := tarWriter.Write(repositoriesData); err != nil {
-		return fmt.Errorf("写入repositories数据失败: %w", err)
+	if len(report.Succeeded) > 0 {
+		b.WriteString("\n成功:\n")
+		for _, image := range report.Succeeded {
+			fmt.Fprintf(&b, "  [OK]   %s\n", image)
+		}
 	}
-
-	log.Printf("批量下载完成，共处理 %d 个镜像", len(imageRefs))
-	return nil
+	if len(report.Failed) > 0 {
+		b.WriteString("\n失败:\n")
+		for _, item := range report.Failed {
+			fmt.Fprintf(&b, "  [FAIL] %s\n", item.Image)
+			fmt.Fprintf(&b, "         原因: %s\n", item.Error)
+		}
+	}
+	return b.String()
 }

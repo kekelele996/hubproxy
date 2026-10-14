@@ -28,10 +28,33 @@ const batchStatus = ref('')
 const batchError = ref('')
 const batchLoading = ref(false)
 
+interface BatchCheckItem {
+  image: string
+  ok: boolean
+  error?: string
+}
+
+const batchChecks = ref<BatchCheckItem[]>([])
+const failedChecks = () => batchChecks.value.filter((item) => !item.ok)
+
 async function preflight(images: string[]) {
   for (const image of [...new Set(images)]) {
     await fetchImageInfo(image)
   }
+}
+
+// 逐项校验镜像，单项失败不影响其他项
+async function checkBatchImages(images: string[]): Promise<BatchCheckItem[]> {
+  return Promise.all(
+    images.map(async (image) => {
+      try {
+        await fetchImageInfo(image)
+        return { image, ok: true }
+      } catch (e) {
+        return { image, ok: false, error: errorMessage(e, '镜像不可用') }
+      }
+    }),
+  )
 }
 
 async function onSingleSubmit() {
@@ -69,10 +92,15 @@ async function onSingleSubmit() {
 async function onBatchSubmit() {
   batchError.value = ''
   batchStatus.value = ''
-  const images = batchText.value
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line && !line.startsWith('#'))
+  batchChecks.value = []
+  const images = [
+    ...new Set(
+      batchText.value
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line && !line.startsWith('#')),
+    ),
+  ]
 
   if (images.length === 0) {
     batchError.value = '请输入镜像列表'
@@ -80,17 +108,31 @@ async function onBatchSubmit() {
   }
 
   batchLoading.value = true
-  batchStatus.value = '正在准备批量下载...'
+  batchStatus.value = '正在逐个校验镜像...'
   try {
-    await preflight(images)
+    const checks = await checkBatchImages(images)
+    batchChecks.value = checks
+    const validImages = checks.filter((item) => item.ok).map((item) => item.image)
+    const failedCount = checks.length - validImages.length
+
+    if (validImages.length === 0) {
+      batchStatus.value = ''
+      batchError.value = '镜像全部校验失败，未开始下载'
+      return
+    }
+
+    batchStatus.value = `正在准备下载 ${validImages.length} 个镜像...`
     const data = await prepareBatchDownload({
-      images,
+      images: validImages,
       platform: batchPlatform.value,
       useCompressedLayers: batchCompressed.value,
     })
     if (!data.download_url) throw new Error('下载地址生成失败')
     triggerDownload(data.download_url)
-    batchStatus.value = `开始下载 ${images.length} 个镜像`
+    const skipped = failedCount > 0 ? `，已跳过 ${failedCount} 个校验失败的镜像` : ''
+    batchStatus.value =
+      `开始下载 ${validImages.length} 个镜像${skipped}；` +
+      '打包结果见 tar 包内 download-report.txt'
   } catch (e) {
     batchStatus.value = ''
     batchError.value = errorMessage(e, '下载失败')
@@ -167,6 +209,21 @@ async function onBatchSubmit() {
         <span>压缩层</span>
         <Switch v-model:checked="batchCompressed" />
       </div>
+      <div
+        v-if="failedChecks().length"
+        class="space-y-1 rounded-md border border-destructive/40 p-3 text-sm"
+      >
+        <p class="font-medium text-destructive">以下镜像校验失败，将自动跳过：</p>
+        <ul class="space-y-0.5">
+          <li v-for="item in failedChecks()" :key="item.image" class="text-destructive">
+            {{ item.image }}<span class="opacity-75">：{{ item.error }}</span>
+          </li>
+        </ul>
+      </div>
+      <p class="text-xs text-muted-foreground">
+        单个镜像打包失败会自动跳过，不影响其他镜像；下载完成后可在 tar 包内查看
+        download-report.txt / download-report.json 了解成功与失败明细。
+      </p>
       <Button class="w-full" :disabled="batchLoading" @click="onBatchSubmit">
         <Loader2 v-if="batchLoading" class="size-4 animate-spin" />
         {{ batchLoading ? '准备中...' : '批量下载' }}

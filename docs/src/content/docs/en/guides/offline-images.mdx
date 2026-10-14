@@ -1,4 +1,4 @@
-﻿---
+---
 title: Offline Images
 description: Package Docker images as tar files online, with single and batch download.
 ---
@@ -81,6 +81,43 @@ curl -X POST "https://example.com/api/image/batch?mode=prepare" \
 curl -L -o batch.tar "https://example.com/api/image/batch?token=YOUR_TOKEN"
 ```
 
+### Failure isolation and download report
+
+Batch packaging follows "one image's failure must not affect the others":
+
+- Each image is staged independently in a server-side temp directory and is only written into the final tar after packaging fully succeeds. Images that fail to pull, time out, or do not exist are **skipped**; the rest are packaged normally and the resulting tar can still be loaded with `docker load`.
+- The tar root contains **`download-report.json`** and **`download-report.txt`** with the total count, the succeeded and failed image lists, and the per-image failure reason, for example:
+
+```text
+HubProxy 批量下载报告
+总数: 3，成功: 2，失败: 1
+
+成功:
+  [OK]   nginx:latest
+  [OK]   redis:7
+
+失败:
+  [FAIL] registry.example.com/missing:latest
+         原因: ...
+```
+
+- If **every** image in the batch fails, no tar is returned: the response is HTTP `502` with a JSON body that lists each failure reason directly:
+
+```json
+{
+  "error": "所有镜像均打包失败",
+  "report": {
+    "total": 1,
+    "success_count": 0,
+    "failure_count": 1,
+    "succeeded": [],
+    "failed": [{ "image": "registry.example.com/missing:latest", "error": "..." }]
+  }
+}
+```
+
+- Packaging uses one temporary file per image in the system temp directory (override with `TMPDIR`). Peak disk usage is roughly the size of the **largest single image** in the batch, so make sure that directory has enough free space.
+
 ## Image Info
 
 ```bash
@@ -104,5 +141,7 @@ maxImages = 10
 ## Notes
 
 - Large images take longer; streamed downloads must restart if interrupted
+- In a batch, failed images are skipped; see `download-report.txt` inside the tar for succeeded/failed details. If all images fail, a JSON error is returned (HTTP 502)
+- The server temp directory (`TMPDIR`) needs free disk space roughly equal to the largest single image
 - Subject to `[access]` lists and IP rate limiting
 - Frontend static routes (`/`, `/images`, `/search`, `/assets/*`) are not rate-limited; `/ready`, API, and proxy requests all count
