@@ -55,6 +55,9 @@ func GitHubProxyHandler(c *gin.Context) {
 		rawPath = "https://" + rawPath
 	}
 
+	c.Set(utils.ContextKeyAccessType, utils.AccessTypeGitHub)
+	c.Set(utils.ContextKeyAccessTarget, rawPath)
+
 	matches := CheckGitHubURL(rawPath)
 	if matches != nil {
 		if allowed, reason := utils.GlobalAccessController.CheckGitHubAccess(matches); !allowed {

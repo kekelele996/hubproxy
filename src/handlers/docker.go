@@ -123,6 +123,9 @@ func handleRegistryRequest(c *gin.Context, path string) {
 		imageName = "library/" + imageName
 	}
 
+	c.Set(utils.ContextKeyAccessType, utils.AccessTypeDocker)
+	c.Set(utils.ContextKeyAccessTarget, imageName)
+
 	if allowed, reason := utils.GlobalAccessController.CheckDockerAccess(imageName); !allowed {
 		fmt.Printf("Docker镜像 %s 访问被拒绝: %s\n", imageName, reason)
 		c.String(http.StatusForbidden, "镜像访问被限制")
@@ -302,6 +305,9 @@ func handleTagsRequest(c *gin.Context, imageRef string) {
 
 // ProxyDockerAuthGin Docker认证代理
 func ProxyDockerAuthGin(c *gin.Context) {
+	c.Set(utils.ContextKeyAccessType, utils.AccessTypeToken)
+	c.Set(utils.ContextKeyAccessTarget, c.Query("service"))
+
 	if utils.IsTokenCacheEnabled() {
 		proxyDockerAuthWithCache(c)
 	} else {
@@ -473,6 +479,10 @@ func handleMultiRegistryRequest(c *gin.Context, registryDomain, remainingPath st
 	}
 
 	fullImageName := registryDomain + "/" + imageName
+
+	c.Set(utils.ContextKeyAccessType, utils.AccessTypeDocker)
+	c.Set(utils.ContextKeyAccessTarget, fullImageName)
+
 	if allowed, reason := utils.GlobalAccessController.CheckDockerAccess(fullImageName); !allowed {
 		fmt.Printf("镜像 %s 访问被拒绝: %s\n", fullImageName, reason)
 		c.String(http.StatusForbidden, "镜像访问被限制")

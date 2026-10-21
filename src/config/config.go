@@ -55,6 +55,15 @@ type AppConfig struct {
 		Enabled    bool   `toml:"enabled"`
 		DefaultTTL string `toml:"defaultTTL"`
 	} `toml:"tokenCache"`
+
+	AccessLog struct {
+		Enabled    bool `toml:"enabled"`
+		MaxEntries int  `toml:"maxEntries"`
+	} `toml:"accessLog"`
+
+	Admin struct {
+		Token string `toml:"token"`
+	} `toml:"admin"`
 }
 
 var (
@@ -143,6 +152,18 @@ func DefaultConfig() *AppConfig {
 		}{
 			Enabled:    true,
 			DefaultTTL: "20m",
+		},
+		AccessLog: struct {
+			Enabled    bool `toml:"enabled"`
+			MaxEntries int  `toml:"maxEntries"`
+		}{
+			Enabled:    true,
+			MaxEntries: 10000,
+		},
+		Admin: struct {
+			Token string `toml:"token"`
+		}{
+			Token: "",
 		},
 	}
 }
@@ -274,5 +295,19 @@ func overrideFromEnv(cfg *AppConfig) {
 		if maxImages, err := strconv.Atoi(val); err == nil && maxImages > 0 {
 			cfg.Download.MaxImages = maxImages
 		}
+	}
+
+	if val := os.Getenv("ACCESS_LOG_ENABLED"); val != "" {
+		if enabled, err := strconv.ParseBool(val); err == nil {
+			cfg.AccessLog.Enabled = enabled
+		}
+	}
+	if val := os.Getenv("ACCESS_LOG_MAX_ENTRIES"); val != "" {
+		if maxEntries, err := strconv.Atoi(val); err == nil && maxEntries > 0 {
+			cfg.AccessLog.MaxEntries = maxEntries
+		}
+	}
+	if val, ok := os.LookupEnv("ADMIN_TOKEN"); ok {
+		cfg.Admin.Token = strings.TrimSpace(val)
 	}
 }

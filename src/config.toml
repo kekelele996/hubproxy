@@ -89,3 +89,17 @@ enabled = true
 enabled = true
 # 默认缓存时间(分钟)
 defaultTTL = "20m"
+
+[accessLog]
+# 是否记录每次代理访问（来源IP、目标、时间、上下行流量）
+enabled = true
+# 内存中保留的最近访问记录条数，超出后最旧记录自动淘汰
+# 也可通过环境变量 ACCESS_LOG_ENABLED / ACCESS_LOG_MAX_ENTRIES 配置
+maxEntries = 10000
+
+[admin]
+# 访问统计管理接口令牌（/api/admin/access/*）
+# 配置后需通过 Authorization: Bearer <token> 访问；
+# 留空时管理接口仅允许本机回环访问。
+# 也可通过环境变量 ADMIN_TOKEN 配置
+token = ""

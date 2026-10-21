@@ -743,6 +743,10 @@ func handleDirectImageDownload(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "镜像引用格式错误: " + err.Error()})
 		return
 	}
+
+	c.Set(utils.ContextKeyAccessType, utils.AccessTypeImageTar)
+	c.Set(utils.ContextKeyAccessTarget, imageRef)
+
 	if allowed, reason := utils.GlobalAccessController.CheckDockerAccess(imageRef); !allowed {
 		c.JSON(http.StatusForbidden, gin.H{"error": reason})
 		return
@@ -794,6 +798,7 @@ func handleDirectImageDownload(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "下载令牌与镜像不匹配"})
 		return
 	}
+	c.Set(utils.ContextKeyAccessTarget, req.Image)
 	if allowed, reason := utils.GlobalAccessController.CheckDockerAccess(req.Image); !allowed {
 		c.JSON(http.StatusForbidden, gin.H{"error": reason})
 		return
@@ -834,6 +839,9 @@ func handleSimpleBatchDownload(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "镜像列表不能为空"})
 			return
 		}
+
+		c.Set(utils.ContextKeyAccessType, utils.AccessTypeImageTar)
+		c.Set(utils.ContextKeyAccessTarget, strings.Join(req.Images, ","))
 
 		options := &StreamOptions{
 			Platform:            req.Platform,
@@ -900,6 +908,9 @@ func handleSimpleBatchDownload(c *gin.Context) {
 		})
 		return
 	}
+
+	c.Set(utils.ContextKeyAccessType, utils.AccessTypeImageTar)
+	c.Set(utils.ContextKeyAccessTarget, strings.Join(req.Images, ","))
 
 	userID := getUserID(c)
 	contentKey := generateContentFingerprint(req.Images, req.Platform)

@@ -135,3 +135,110 @@ export function triggerDownload(url: string) {
   link.click()
   document.body.removeChild(link)
 }
+
+// ===== 访问统计（管理接口）=====
+
+const ADMIN_TOKEN_KEY = 'hubproxy_admin_token'
+
+export function getAdminToken(): string {
+  return localStorage.getItem(ADMIN_TOKEN_KEY) || ''
+}
+
+export function saveAdminToken(token: string) {
+  localStorage.setItem(ADMIN_TOKEN_KEY, token.trim())
+}
+
+export function clearAdminToken() {
+  localStorage.removeItem(ADMIN_TOKEN_KEY)
+}
+
+export interface AccessRecord {
+  id: number
+  time: string
+  ip: string
+  user_agent: string
+  method: string
+  path: string
+  type: string
+  target: string
+  status_code: number
+  bytes_in: number
+  bytes_out: number
+  duration_ms: number
+}
+
+export interface AccessSummaryGroup {
+  key: string
+  requests: number
+  bytes_in: number
+  bytes_out: number
+  errors: number
+  first_at: string
+  last_at: string
+}
+
+export interface AccessTotals {
+  requests: number
+  bytes_in: number
+  bytes_out: number
+  errors: number
+  first_at: string
+  last_at: string
+}
+
+export interface AccessSummaryResponse {
+  group_by: string
+  totals: AccessTotals
+  groups: AccessSummaryGroup[]
+}
+
+export interface AccessLogsResponse {
+  total: number
+  page: number
+  page_size: number
+  items: AccessRecord[]
+}
+
+export interface AccessQueryParams {
+  ip?: string
+  type?: string
+  target?: string
+  start?: number
+  end?: number
+}
+
+function appendAccessFilters(params: URLSearchParams, q?: AccessQueryParams) {
+  if (q?.ip) params.set('ip', q.ip)
+  if (q?.type) params.set('type', q.type)
+  if (q?.target) params.set('target', q.target)
+  if (q?.start) params.set('start', String(q.start))
+  if (q?.end) params.set('end', String(q.end))
+}
+
+async function adminGetJSON<T>(url: string): Promise<T> {
+  const token = getAdminToken()
+  const res = await fetch(url, {
+    headers: {
+      Accept: 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    cache: 'no-store',
+  })
+  if (!res.ok) throw new ApiError(await parseError(res), res.status)
+  return (await res.json()) as T
+}
+
+export function fetchAccessSummary(groupBy: string, q?: AccessQueryParams) {
+  const params = new URLSearchParams({ group_by: groupBy })
+  appendAccessFilters(params, q)
+  return adminGetJSON<AccessSummaryResponse>(`/api/admin/access/summary?${params}`)
+}
+
+export function fetchAccessLogs(q: AccessQueryParams | undefined, page: number, pageSize = 50) {
+  const params = new URLSearchParams({
+    page: String(page),
+    page_size: String(pageSize),
+  })
+  appendAccessFilters(params, q)
+  return adminGetJSON<AccessLogsResponse>(`/api/admin/access/logs?${params}`)
+}

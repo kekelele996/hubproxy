@@ -1,4 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
+import AccessPage from '@/pages/AccessPage.vue'
 import HomePage from '@/pages/HomePage.vue'
 import ImagesPage from '@/pages/ImagesPage.vue'
 import SearchPage from '@/pages/SearchPage.vue'
@@ -20,6 +21,11 @@ const router = createRouter({
       path: '/search',
       component: SearchPage,
       meta: { title: '镜像搜索' },
+    },
+    {
+      path: '/admin/access',
+      component: AccessPage,
+      meta: { title: '访问统计' },
     },
   ],
   scrollBehavior(to, from, savedPosition) {

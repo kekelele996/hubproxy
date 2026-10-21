@@ -66,6 +66,7 @@ func registerFrontendRoutes(router *gin.Engine, enabled bool) {
 		router.GET("/", notFound)
 		router.GET("/images", notFound)
 		router.GET("/search", notFound)
+		router.GET("/admin/access", notFound)
 		router.GET("/assets/*filepath", notFound)
 		router.GET("/favicon.ico", notFound)
 		return
@@ -74,6 +75,7 @@ func registerFrontendRoutes(router *gin.Engine, enabled bool) {
 	router.GET("/", serveSPA)
 	router.GET("/images", serveSPA)
 	router.GET("/search", serveSPA)
+	router.GET("/admin/access", serveSPA)
 	router.GET("/favicon.ico", func(c *gin.Context) {
 		serveEmbedFile(c, "dist/favicon.ico")
 	})
@@ -100,10 +102,12 @@ func buildRouter(cfg *config.AppConfig) *gin.Engine {
 		})
 	}))
 
+	router.Use(utils.AccessLogMiddleware(utils.GlobalAccessLogger))
 	router.Use(utils.RateLimitMiddleware(globalLimiter))
 
 	initHealthRoutes(router)
 	handlers.InitImageTarRoutes(router)
+	handlers.RegisterAdminRoutes(router)
 	registerFrontendRoutes(router, cfg.Server.EnableFrontend)
 	handlers.RegisterSearchRoute(router)
 
@@ -121,18 +125,28 @@ func main() {
 		return
 	}
 
+	cfg := config.GetConfig()
+
 	utils.InitHTTPClients()
 	globalLimiter = utils.InitGlobalLimiter()
+	utils.InitAccessLogger(cfg.AccessLog.Enabled, cfg.AccessLog.MaxEntries)
 	handlers.InitDockerProxy()
 	handlers.InitImageStreamer()
 	handlers.InitDebouncer()
 
-	cfg := config.GetConfig()
 	router := buildRouter(cfg)
 
 	fmt.Printf("HubProxy 启动成功\n")
 	fmt.Printf("监听地址: %s:%d\n", cfg.Server.Host, cfg.Server.Port)
 	fmt.Printf("限流配置: %d请求/%g小时\n", cfg.RateLimit.RequestLimit, cfg.RateLimit.PeriodHours)
+	if cfg.AccessLog.Enabled {
+		fmt.Printf("访问记录: 已启用（保留最近 %d 条）\n", cfg.AccessLog.MaxEntries)
+		if cfg.Admin.Token == "" {
+			fmt.Printf("访问统计: 管理接口仅允许本机访问，可通过 admin.token / ADMIN_TOKEN 配置令牌\n")
+		}
+	} else {
+		fmt.Printf("访问记录: 未启用\n")
+	}
 	if cfg.Server.EnableH2C {
 		fmt.Printf("H2c: 已启用\n")
 	}

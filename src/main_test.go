@@ -30,6 +30,7 @@ func newTestRouter(t *testing.T, configBody string) *gin.Engine {
 
 	utils.InitHTTPClients()
 	globalLimiter = utils.InitGlobalLimiter()
+	utils.InitAccessLogger(true, 1000)
 	handlers.InitDockerProxy()
 	handlers.InitImageStreamer()
 	handlers.InitDebouncer()
